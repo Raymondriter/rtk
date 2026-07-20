@@ -199,9 +199,8 @@ The registry (`src/discover/registry.rs`) handles command patterns across these 
 
 The registry handles `&&`, `||`, `;`, `|`, and `&` operators:
 
-- **Pipe** (`|`): Only the left side is rewritten (right side consumes output format)
+- **Pipe** (`|`, `|&`): A stage feeding a pipe is rewritten only when every downstream stage is display-only (`head`, `tail` without follow, `cat`) — then the agent is still the real reader. Any content-consuming stage (`wc`, `xargs`, `grep`, …) keeps the producer raw, because rtk's reshaped output corrupts programs that parse it (#2962). Pipe consumers themselves always run raw.
 - **And/Or/Semicolon** (`&&`, `||`, `;`): Both sides rewritten independently
-- **find/fd in pipes**: Never rewritten (output format incompatible with xargs/wc/grep)
 
 Example: `cargo fmt --all && cargo test` becomes `rtk cargo fmt --all && rtk cargo test`
 

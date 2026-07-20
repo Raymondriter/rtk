@@ -5,7 +5,7 @@ use lazy_static::lazy_static;
 use regex::{Regex, RegexSet};
 use std::path::Path;
 
-use super::lexer::{split_on_operators, tokenize, TokenKind};
+use super::lexer::{split_on_operators, tokenize, ParsedToken, TokenKind};
 use super::rules::{IGNORED_EXACT, IGNORED_PREFIXES, RULES};
 
 const PHP_TOOL_NAMES: [&str; 6] = ["phpunit", "phpstan", "ecs", "pest", "paratest", "pint"];
@@ -595,6 +595,77 @@ pub fn rewrite_command(
     rewrite_compound(trimmed, &compiled, &normalized_prefixes)
 }
 
+/// Post-resolution command identity of one pipeline stage: strips the same
+/// wrapper layers as `rewrite_segment_inner` (sudo/env/VAR=, shell builtins,
+/// user transparent_prefixes, absolute paths) so eligibility checks cannot be
+/// bypassed by `command grep …`, `sudo grep …`, or `/usr/bin/grep …` (#2962).
+fn resolve_stage_command(seg: &str, transparent_prefixes: &[String]) -> String {
+    let mut current = seg.trim().to_string();
+    for _ in 0..MAX_PREFIX_DEPTH {
+        let stripped = ENV_PREFIX.replace(&current, "").trim().to_string();
+        let mut next = stripped;
+        for &prefix in BUILTIN_TRANSPARENT_PREFIXES {
+            if let Some(rest) = strip_word_prefix(&next, prefix) {
+                next = rest.trim().to_string();
+                break;
+            }
+        }
+        for prefix in transparent_prefixes {
+            if let Some(rest) = strip_word_prefix(&next, prefix) {
+                next = rest.trim().to_string();
+                break;
+            }
+        }
+        next = strip_absolute_path(&next);
+        if next == current {
+            break;
+        }
+        current = next;
+    }
+    current
+}
+
+/// A pipe stage is display-only when it bounds or forwards its stdin for the
+/// agent to read without parsing content: `head`, `cat`, and `tail` without a
+/// follow flag (`tail -f` waits on stdin and must never gate a rewrite).
+fn is_display_only_stage(seg: &str, transparent_prefixes: &[String]) -> bool {
+    let resolved = resolve_stage_command(seg, transparent_prefixes);
+    let mut words = resolved.split_whitespace();
+    let cmd = words.next().unwrap_or("");
+    match cmd {
+        "head" | "cat" => true,
+        "tail" => !words.any(|arg| {
+            arg == "-F"
+                || arg.starts_with("--follow")
+                || (arg.starts_with('-') && !arg.starts_with("--") && arg[1..].contains(['f', 'F']))
+        }),
+        _ => false,
+    }
+}
+
+/// True when every stage after the pipe at `pipe_offset` (up to `group_end`)
+/// is display-only, meaning the producer's rtk-shaped output still reaches the
+/// agent unparsed and its rewrite is safe. Any content-consuming stage (`wc`,
+/// `xargs`, `grep`, …) means the producer must stay raw (#2962, #1560, #439).
+fn pipe_tail_display_only(
+    cmd: &str,
+    tokens: &[ParsedToken],
+    pipe_offset: usize,
+    group_end: usize,
+    transparent_prefixes: &[String],
+) -> bool {
+    let pipes: Vec<&ParsedToken> = tokens
+        .iter()
+        .filter(|t| t.kind == TokenKind::Pipe && t.offset >= pipe_offset && t.offset < group_end)
+        .collect();
+    pipes.iter().enumerate().all(|(i, p)| {
+        let start = p.offset + p.value.len();
+        let end = pipes.get(i + 1).map(|n| n.offset).unwrap_or(group_end);
+        let stage = cmd[start..end].trim();
+        !stage.is_empty() && is_display_only_stage(stage, transparent_prefixes)
+    })
+}
+
 /// Rewrite a compound command (with `&&`, `||`, `;`, `|`) by rewriting each segment.
 fn rewrite_compound(
     cmd: &str,
@@ -637,26 +708,34 @@ fn rewrite_compound(
             }
             TokenKind::Pipe => {
                 let seg = cmd[seg_start..tok.offset].trim();
-                let is_pipe_incompatible = seg.starts_with("find ")
-                    || seg == "find"
-                    || seg.starts_with("fd ")
-                    || seg == "fd";
-                let rewritten = if is_pipe_incompatible {
-                    seg.to_string()
-                } else {
-                    rewrite_segment(seg, excluded, transparent_prefixes)
-                        .unwrap_or_else(|| seg.to_string())
-                };
-                if rewritten != seg {
-                    any_changed = true;
-                }
-                result.push_str(&rewritten);
-
                 let pipe_group_end = tokens.iter().find(|t| {
                     t.offset > tok.offset
                         && (t.kind == TokenKind::Operator
                             || (t.kind == TokenKind::Shellism && t.value == "&"))
                 });
+
+                // A pipe-feeding stage's stdout goes to a program, not the
+                // agent: rtk's reshaped output corrupts the consumer
+                // (`grep … | wc -l` counted headers, #2962/#1560; `find | xargs`,
+                // #439). Rewrite only when every downstream stage is
+                // display-only, so the agent is still the real reader.
+                let group_end_off = pipe_group_end.map(|t| t.offset).unwrap_or(cmd.len());
+                let rewritten = if pipe_tail_display_only(
+                    cmd,
+                    &tokens,
+                    tok.offset,
+                    group_end_off,
+                    transparent_prefixes,
+                ) {
+                    rewrite_segment(seg, excluded, transparent_prefixes)
+                        .unwrap_or_else(|| seg.to_string())
+                } else {
+                    seg.to_string()
+                };
+                if rewritten != seg {
+                    any_changed = true;
+                }
+                result.push_str(&rewritten);
 
                 match pipe_group_end {
                     Some(next_op) => {
@@ -1693,10 +1772,15 @@ mod tests {
 
     #[test]
     fn test_rewrite_pipe_first_only() {
-        // After a pipe, the filter command stays raw
+        // A content-consuming pipe tail keeps the producer raw (#2962); a
+        // display-only tail keeps the producer rewrite and its savings.
         assert_eq!(
             rewrite_command_no_prefixes("git log -10 | grep feat", &[]),
-            Some("rtk git log -10 | grep feat".into())
+            None
+        );
+        assert_eq!(
+            rewrite_command_no_prefixes("git log -10 | head -5", &[]),
+            Some("rtk git log -10 | head -5".into())
         );
     }
 
@@ -3549,10 +3633,11 @@ mod tests {
 
     #[test]
     fn test_rewrite_compound_pipe_raw_filter() {
-        // Pipe: rewrite first segment only, pass through rest unchanged
+        // grep parses the producer's stdout: rtk cargo's reshaped output would
+        // corrupt it, so the whole pipeline stays raw (#2962/#1560).
         assert_eq!(
             rewrite_command_no_prefixes("cargo test | grep FAILED", &[]),
-            Some("rtk cargo test | grep FAILED".into())
+            None
         );
     }
 
@@ -3560,7 +3645,7 @@ mod tests {
     fn test_rewrite_compound_pipe_git_grep() {
         assert_eq!(
             rewrite_command_no_prefixes("git log -10 | grep feat", &[]),
-            Some("rtk git log -10 | grep feat".into())
+            None
         );
     }
 
@@ -4288,6 +4373,145 @@ mod tests {
         );
     }
 
+    // --- Pipe-feeding stages stay raw unless tail is display-only (#2962, #1560, #439) ---
+
+    #[test]
+    fn test_rewrite_pipe_content_consumers_stay_raw() {
+        // Each consumer parses the producer's stdout; rtk's reshaped output
+        // corrupted them (grep|wc counted 28 for 60 real matches, #2962).
+        for cmd in [
+            "grep -n match sixty.txt | wc -l",
+            "git status --short | wc -l",
+            "git branch | grep feat",
+            "ls -la | grep rs",
+            "cat f.txt | grep x",
+            "git diff --name-only | xargs wc -l",
+            "ps aux | grep python",
+        ] {
+            assert_eq!(rewrite_command_no_prefixes(cmd, &[]), None, "cmd: {cmd}");
+        }
+    }
+
+    #[test]
+    fn test_rewrite_pipe_display_only_tail_keeps_rewrite() {
+        // head/tail/cat only bound what the agent reads — the agent is still
+        // the real consumer, so the producer rewrite (and savings) stay.
+        assert_eq!(
+            rewrite_command_no_prefixes("git log --oneline | head -20", &[]),
+            Some("rtk git log --oneline | head -20".into())
+        );
+        assert_eq!(
+            rewrite_command_no_prefixes("ls -t | head -1", &[]),
+            Some("rtk ls -t | head -1".into())
+        );
+        assert_eq!(
+            rewrite_command_no_prefixes("git log | tail -50", &[]),
+            Some("rtk git log | tail -50".into())
+        );
+        assert_eq!(
+            rewrite_command_no_prefixes("git log | head -20 | cat", &[]),
+            Some("rtk git log | head -20 | cat".into())
+        );
+    }
+
+    #[test]
+    fn test_rewrite_pipe_find_subsumed_by_general_rule() {
+        // The old find/fd carve-out (#439) is now the general rule: raw before
+        // a content consumer, rewritten before a display-only tail.
+        assert_eq!(
+            rewrite_command_no_prefixes("find . -name '*.rs' | xargs grep TODO", &[]),
+            None
+        );
+        assert_eq!(
+            rewrite_command_no_prefixes("find . -name '*.rs' | head -20", &[]),
+            Some("rtk find . -name '*.rs' | head -20".into())
+        );
+    }
+
+    #[test]
+    fn test_rewrite_pipe_mixed_tail_stays_raw() {
+        // One content consumer anywhere downstream keeps the producer raw.
+        assert_eq!(
+            rewrite_command_no_prefixes("git log | head -20 | wc -l", &[]),
+            None
+        );
+    }
+
+    #[test]
+    fn test_rewrite_pipe_tail_follow_not_display_only() {
+        // tail -f waits on stdin forever; it must never gate a rewrite.
+        assert_eq!(rewrite_command_no_prefixes("git log | tail -f", &[]), None);
+        assert_eq!(rewrite_command_no_prefixes("git log | tail -F", &[]), None);
+        assert_eq!(
+            rewrite_command_no_prefixes("git log | tail --follow", &[]),
+            None
+        );
+        assert_eq!(
+            rewrite_command_no_prefixes("git log | tail -fn 10", &[]),
+            None
+        );
+    }
+
+    #[test]
+    fn test_rewrite_pipe_tail_wrapper_prefix_no_bypass() {
+        // The eligibility check resolves wrappers the same way the rewriter
+        // does — `command wc` is still wc, `command head` is still head.
+        assert_eq!(
+            rewrite_command_no_prefixes("git log | command wc -l", &[]),
+            None
+        );
+        assert_eq!(
+            rewrite_command_no_prefixes("git log | command head -5", &[]),
+            Some("rtk git log | command head -5".into())
+        );
+        assert_eq!(
+            rewrite_command_no_prefixes("git log | /usr/bin/wc -l", &[]),
+            None
+        );
+        assert_eq!(
+            rewrite_command_no_prefixes("sudo git log | head -5", &[]),
+            Some("sudo rtk git log | head -5".into())
+        );
+    }
+
+    #[test]
+    fn test_rewrite_pipe_transparent_prefix_tail_resolved() {
+        let prefixes = vec!["direnv exec .".to_string()];
+        assert_eq!(
+            super::rewrite_command("git log | direnv exec . wc -l", &[], &prefixes),
+            None
+        );
+    }
+
+    #[test]
+    fn test_rewrite_stderr_pipe_not_mangled() {
+        // `|&` used to be split into `| &` — a bash syntax error. It must now
+        // behave like any pipe: raw before a content consumer, and segments
+        // after && still rewritten with the operator intact.
+        assert_eq!(
+            rewrite_command_no_prefixes("grep x f.txt |& wc -l", &[]),
+            None
+        );
+        assert_eq!(
+            rewrite_command_no_prefixes("git status && grep x f.txt |& wc -l", &[]),
+            Some("rtk git status && grep x f.txt |& wc -l".into())
+        );
+    }
+
+    #[test]
+    fn test_rewrite_pipe_trailing_empty_stage() {
+        assert_eq!(rewrite_command_no_prefixes("git log |", &[]), None);
+    }
+
+    #[test]
+    fn test_rewrite_pipe_display_tail_respects_exclusions() {
+        let excluded = vec!["git".to_string()];
+        assert_eq!(
+            rewrite_command_no_prefixes("git log | head -5", &excluded),
+            None
+        );
+    }
+
     // --- Pipe + operator rewrite ---
 
     #[test]
@@ -4308,9 +4532,10 @@ mod tests {
 
     #[test]
     fn test_rewrite_pipe_then_or() {
+        // Producer stays raw before grep; the segment after || still rewrites.
         assert_eq!(
             rewrite_command_no_prefixes("cargo test | grep FAIL || git stash", &[]),
-            Some("rtk cargo test | grep FAIL || rtk git stash".into())
+            Some("cargo test | grep FAIL || rtk git stash".into())
         );
     }
 
@@ -4321,7 +4546,7 @@ mod tests {
                 "RUST_BACKTRACE=1 cargo test 2>&1 | grep FAILED && git stash",
                 &[]
             ),
-            Some("RUST_BACKTRACE=1 rtk cargo test 2>&1 | grep FAILED && rtk git stash".into())
+            Some("RUST_BACKTRACE=1 cargo test 2>&1 | grep FAILED && rtk git stash".into())
         );
     }
 
@@ -4329,7 +4554,7 @@ mod tests {
     fn test_rewrite_and_then_pipe() {
         assert_eq!(
             rewrite_command_no_prefixes("git status && cargo test | grep FAIL", &[]),
-            Some("rtk git status && rtk cargo test | grep FAIL".into())
+            Some("rtk git status && cargo test | grep FAIL".into())
         );
     }
 
