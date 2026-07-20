@@ -6,7 +6,7 @@
 //! used (see `Engine`); the compression is identical because both emit the same
 //! `file:line:content` shape.
 
-use crate::core::stream::{exec_capture, exec_capture_stdin, CaptureResult};
+use crate::core::stream::{exec_capture, exec_capture_stdin, status_to_exit_code, CaptureResult};
 use crate::core::tracking;
 use crate::core::utils::{resolved_command, strip_ansi};
 use crate::core::{args_utils, config};
@@ -353,6 +353,170 @@ fn has_context_flag(flags: &[String]) -> bool {
         })
 }
 
+/// Bound on the tracking buffer kept while streaming stdin — metrics are
+/// best-effort on unbounded input; memory stays flat (<5MB target).
+const STREAM_BUFFER_CAP: usize = 65_536;
+
+fn stdin_only_paths(paths: &[String]) -> bool {
+    paths.is_empty() || paths.iter().all(|p| p == "-")
+}
+
+/// Streaming stdin mode: emit each match as it arrives instead of buffering to
+/// EOF. A pipeline like `tail -f log | rtk grep ERROR` must deliver output
+/// while the producer runs — capture-to-EOF returned nothing on kill where raw
+/// grep had already flushed its blocks (#2962 phase 2). No upfront header (the
+/// total is unknowable mid-stream); overflow gets a footer + tee hint at EOF.
+#[allow(clippy::too_many_arguments)]
+fn run_streamed_stdin(
+    timer: &tracking::TimedExecution,
+    engine: Engine,
+    extra_args: &[String],
+    patterns: &[String],
+    pattern_display: &str,
+    real_cmd: &str,
+    rtk_label: &str,
+    max_line_len: usize,
+    max_results: usize,
+    context_only: bool,
+) -> Result<i32> {
+    use std::io::{BufRead, BufReader, Write};
+
+    let mut cmd = resolved_command(engine.bin());
+    cmd.args(engine.parse_flags());
+    for a in extra_args {
+        cmd.arg(a);
+    }
+    for p in patterns {
+        cmd.args(["-e", p]);
+    }
+    cmd.arg("--");
+    cmd.stdin(std::process::Stdio::inherit());
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::inherit());
+
+    let mut child = cmd.spawn().context("failed to spawn search engine")?;
+    let Some(child_out) = child.stdout.take() else {
+        let code = child.wait().map(status_to_exit_code).unwrap_or(1);
+        return Ok(code);
+    };
+
+    let context_re = if context_only {
+        Regex::new(&format!(
+            "(?i).{{0,20}}{}.*",
+            regex::escape(pattern_display)
+        ))
+        .ok()
+    } else {
+        None
+    };
+
+    let show_file = has_short_flag(extra_args, 'H')
+        || has_short_flag(extra_args, 'r')
+        || has_short_flag(extra_args, 'R')
+        || extra_args
+            .iter()
+            .any(|f| f == "--with-filename" || f == "--recursive");
+    let show_line = !has_short_flag(extra_args, 'N')
+        && !extra_args.iter().any(|f| f == "--no-line-number");
+
+    // stdin is one pseudo-file: apply the same per-file cap as file mode.
+    let cap = max_results.min(config::limits().grep_max_per_file);
+
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    let mut emitted: usize = 0;
+    let mut total: usize = 0;
+    let mut head: Vec<String> = Vec::new();
+    let mut tee: Option<crate::core::tee::TeeStream> = None;
+    let mut tracked = String::new();
+    let mut output = String::new();
+
+    for line in BufReader::new(child_out).lines() {
+        let Ok(line) = line else { break };
+        let rendered = match parse_match_line(&line) {
+            Some((file, line_num, is_match, content)) => {
+                let cleaned =
+                    clean_line(content, max_line_len, context_re.as_ref(), pattern_display);
+                let sep = if is_match { ':' } else { '-' };
+                let mut r = String::new();
+                if show_file {
+                    r.push_str(&compact_path(&file));
+                    r.push(sep);
+                }
+                if show_line {
+                    r.push_str(&line_num.to_string());
+                    r.push(sep);
+                }
+                r.push_str(&cleaned);
+                r
+            }
+            // Shapes the parser doesn't know (context separators, engine
+            // notices) pass through verbatim, minus the --null parse aid.
+            None => line.replace('\0', ":"),
+        };
+        total += 1;
+        if tracked.len() < STREAM_BUFFER_CAP {
+            tracked.push_str(&rendered);
+            tracked.push('\n');
+        }
+
+        if total <= cap {
+            head.push(rendered.clone());
+            // Downstream closed early: stop emitting, never fail the command.
+            if writeln!(out, "{}", rendered).is_err() {
+                break;
+            }
+            emitted += 1;
+            continue;
+        }
+
+        // Cap exceeded. The hint must be emitted NOW, not at an EOF that a
+        // followed stream never reaches — a cap without a live recovery path
+        // would silently mute the monitor (#2962). The tee file is written
+        // through (flushed per line) so it survives a killed pipeline.
+        if total == cap + 1 {
+            tee = crate::core::tee::TeeStream::create(&format!("{}_stdin", engine.label()));
+            if let Some(ref mut t) = tee {
+                for h in &head {
+                    t.write_line(h);
+                }
+                let hint = format!(
+                    "  +more in (standard input) {}",
+                    t.tail_hint(emitted + 1)
+                );
+                if writeln!(out, "{}", hint).is_err() {
+                    break;
+                }
+                let _ = out.flush();
+                output.push_str(&hint);
+                output.push('\n');
+            }
+        }
+        match tee {
+            Some(ref mut t) => t.write_line(&rendered),
+            // Tee unavailable: capping would hide data with no recovery path,
+            // so stream everything instead (correctness over savings).
+            None => {
+                if writeln!(out, "{}", rendered).is_err() {
+                    break;
+                }
+                emitted += 1;
+            }
+        }
+    }
+    drop(out);
+
+    let exit_code = child.wait().map(status_to_exit_code).unwrap_or(1);
+
+    let mut shown: String = tracked.lines().take(emitted).collect::<Vec<_>>().join("\n");
+    if !shown.is_empty() {
+        shown.push('\n');
+    }
+    shown.push_str(&output);
+    timer.track(real_cmd, rtk_label, &tracked, &shown);
+    Ok(exit_code)
+}
+
 pub fn run(
     engine: Engine,
     max_line_len: usize,
@@ -406,6 +570,21 @@ pub fn run(
     // format/shape flags (-c/-l/-o/...): already-minimal native output, passthrough.
     if has_format_flag(&extra_args) {
         return passthrough(&timer, engine, &args, &real_cmd);
+    }
+
+    if stdin_only_paths(&paths) {
+        return run_streamed_stdin(
+            &timer,
+            engine,
+            &extra_args,
+            &patterns,
+            &pattern_display,
+            &real_cmd,
+            &rtk_label,
+            max_line_len,
+            max_results,
+            context_only,
+        );
     }
 
     let result = engine_capture(engine, &extra_args, &patterns, &paths)?;

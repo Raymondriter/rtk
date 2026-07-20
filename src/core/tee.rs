@@ -235,6 +235,79 @@ pub fn force_tee_tail_hint(
     ))
 }
 
+/// Write-through tee for streamed output: each line is flushed as it arrives,
+/// so the recovery file survives a killed pipeline — a buffered tee written at
+/// EOF loses everything when `tail -f … | rtk grep` is interrupted (#2962).
+pub struct TeeStream {
+    file: std::fs::File,
+    path: PathBuf,
+    written: usize,
+    max_bytes: usize,
+    capped: bool,
+}
+
+impl TeeStream {
+    /// Same gates as `force_tee_hint`: RTK_TEE=0, `tee.enabled`, resolvable dir.
+    pub fn create(command_slug: &str) -> Option<TeeStream> {
+        if std::env::var("RTK_TEE").ok().as_deref() == Some("0") {
+            return None;
+        }
+        let config = Config::load().ok()?;
+        if !config.tee.enabled {
+            return None;
+        }
+        let tee_dir = get_tee_dir(&config)?;
+        std::fs::create_dir_all(&tee_dir).ok()?;
+        let epoch = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?
+            .as_secs();
+        let path = tee_dir.join(format!("{}_{}.log", epoch, sanitize_slug(command_slug)));
+        let stream = TeeStream::new_at(path, config.tee.max_file_size)?;
+        cleanup_old_files(&tee_dir, config.tee.max_files);
+        Some(stream)
+    }
+
+    fn new_at(path: PathBuf, max_bytes: usize) -> Option<TeeStream> {
+        let file = std::fs::File::create(&path).ok()?;
+        Some(TeeStream {
+            file,
+            path,
+            written: 0,
+            max_bytes,
+            capped: false,
+        })
+    }
+
+    /// Append one line and flush immediately. Stops at `max_file_size` with a
+    /// truncation marker, mirroring `write_tee_file`.
+    pub fn write_line(&mut self, line: &str) {
+        use std::io::Write;
+        if self.capped {
+            return;
+        }
+        if self.written + line.len() + 1 > self.max_bytes {
+            self.capped = true;
+            let _ = writeln!(self.file, "\n--- truncated at {} bytes ---", self.written);
+            let _ = self.file.flush();
+            return;
+        }
+        if writeln!(self.file, "{}", line).is_ok() {
+            self.written += line.len() + 1;
+            let _ = self.file.flush();
+        }
+    }
+
+    /// Same shape as `force_tee_tail_hint`'s return.
+    pub fn tail_hint(&self, line_offset: usize) -> String {
+        format!(
+            "[see remaining: tail -n +{} {}]",
+            line_offset,
+            display_path(&self.path)
+        )
+    }
+}
+
 /// TeeMode controls when tee writes files.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Default)]
 #[serde(rename_all = "lowercase")]
