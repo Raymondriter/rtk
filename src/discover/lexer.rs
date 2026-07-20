@@ -118,6 +118,16 @@ fn tokenize_inner(input: &str, emit_newline: bool) -> Vec<ParsedToken> {
                         value: "||".into(),
                         offset: start,
                     });
+                } else if chars.peek() == Some(&'&') {
+                    // `|&` is bash's stderr-merging pipe; tokenizing the `&` separately
+                    // made rewrite_compound emit `| &` — a shell syntax error.
+                    chars.next();
+                    byte_pos += 1;
+                    tokens.push(ParsedToken {
+                        kind: TokenKind::Pipe,
+                        value: "|&".into(),
+                        offset: start,
+                    });
                 } else {
                     tokens.push(ParsedToken {
                         kind: TokenKind::Pipe,
@@ -649,6 +659,29 @@ mod tests {
     #[test]
     fn test_quoted_pipe_not_pipe() {
         let tokens = tokenize("\"a|b\"");
+        assert!(!tokens.iter().any(|t| t.kind == TokenKind::Pipe));
+    }
+
+    #[test]
+    fn test_stderr_pipe_single_token() {
+        let tokens = tokenize("grep x f |& wc -l");
+        let pipes: Vec<_> = tokens
+            .iter()
+            .filter(|t| t.kind == TokenKind::Pipe)
+            .collect();
+        assert_eq!(pipes.len(), 1);
+        assert_eq!(pipes[0].value, "|&");
+        assert!(!tokens
+            .iter()
+            .any(|t| t.kind == TokenKind::Shellism && t.value == "&"));
+    }
+
+    #[test]
+    fn test_stderr_pipe_not_confused_with_background() {
+        let tokens = tokenize("cmd1 & cmd2");
+        assert!(tokens
+            .iter()
+            .any(|t| t.kind == TokenKind::Shellism && t.value == "&"));
         assert!(!tokens.iter().any(|t| t.kind == TokenKind::Pipe));
     }
 
