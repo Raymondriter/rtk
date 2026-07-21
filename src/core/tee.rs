@@ -188,24 +188,26 @@ pub fn tee_and_hint(raw: &str, command_slug: &str, exit_code: i32) -> Option<Str
     Some(format_hint(&path))
 }
 
-fn force_tee_path(content: &str, command_slug: &str) -> Option<PathBuf> {
+/// Shared gate for the force-tee paths: env kill-switch, config enabled flag,
+/// and a created, writable tee directory.
+fn enabled_tee_dir() -> Option<(Config, PathBuf)> {
     if std::env::var("RTK_TEE").ok().as_deref() == Some("0") {
         return None;
     }
-
-    if content.is_empty() {
-        return None;
-    }
-
     let config = Config::load().ok()?;
-
     if !config.tee.enabled {
         return None;
     }
-
     let tee_dir = get_tee_dir(&config)?;
-    let tee_dir = std::fs::create_dir_all(&tee_dir).ok().and(Some(tee_dir))?;
+    std::fs::create_dir_all(&tee_dir).ok()?;
+    Some((config, tee_dir))
+}
 
+fn force_tee_path(content: &str, command_slug: &str) -> Option<PathBuf> {
+    if content.is_empty() {
+        return None;
+    }
+    let (config, tee_dir) = enabled_tee_dir()?;
     write_tee_file(
         content,
         command_slug,
@@ -249,15 +251,7 @@ pub struct TeeStream {
 impl TeeStream {
     /// Same gates as `force_tee_hint`: RTK_TEE=0, `tee.enabled`, resolvable dir.
     pub fn create(command_slug: &str) -> Option<TeeStream> {
-        if std::env::var("RTK_TEE").ok().as_deref() == Some("0") {
-            return None;
-        }
-        let config = Config::load().ok()?;
-        if !config.tee.enabled {
-            return None;
-        }
-        let tee_dir = get_tee_dir(&config)?;
-        std::fs::create_dir_all(&tee_dir).ok()?;
+        let (config, tee_dir) = enabled_tee_dir()?;
         let epoch = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .ok()?
@@ -596,5 +590,36 @@ directory = "/tmp/rtk-tee"
         assert!(hint.starts_with("[see remaining: tail -n +22 "));
         assert!(hint.ends_with(']'));
         assert!(hint.contains("123_docker_images.log"));
+    }
+
+    // --- TeeStream (write-through streaming tee, #2962) ---
+
+    #[test]
+    fn test_tee_stream_writes_lines_and_hint() {
+        let path = std::env::temp_dir().join(format!("rtk_tee_stream_{}.log", std::process::id()));
+        let mut t = TeeStream::new_at(path.clone(), 1024).expect("create stream");
+        t.write_line("one");
+        t.write_line("two");
+        let content = std::fs::read_to_string(&path).expect("read tee file");
+        assert_eq!(content, "one\ntwo\n");
+        let hint = t.tail_hint(2);
+        assert!(hint.starts_with("[see remaining: tail -n +2 "));
+        assert!(hint.ends_with(']'));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_tee_stream_caps_at_max_bytes_with_marker() {
+        let path = std::env::temp_dir().join(format!("rtk_tee_cap_{}.log", std::process::id()));
+        let mut t = TeeStream::new_at(path.clone(), 10).expect("create stream");
+        t.write_line("12345678");
+        t.write_line("overflow line");
+        t.write_line("ignored after cap");
+        let content = std::fs::read_to_string(&path).expect("read tee file");
+        assert!(content.starts_with("12345678\n"));
+        assert!(content.contains("truncated at 9 bytes"));
+        assert!(!content.contains("overflow line"));
+        assert!(!content.contains("ignored after cap"));
+        let _ = std::fs::remove_file(&path);
     }
 }

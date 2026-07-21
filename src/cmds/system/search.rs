@@ -361,99 +361,113 @@ fn stdin_only_paths(paths: &[String]) -> bool {
     paths.is_empty() || paths.iter().all(|p| p == "-")
 }
 
-/// Streaming stdin mode: emit each match as it arrives instead of buffering to
-/// EOF. A pipeline like `tail -f log | rtk grep ERROR` must deliver output
-/// while the producer runs — capture-to-EOF returned nothing on kill where raw
-/// grep had already flushed its blocks (#2962 phase 2). No upfront header (the
-/// total is unknowable mid-stream); overflow gets a footer + tee hint at EOF.
-#[allow(clippy::too_many_arguments)]
-fn run_streamed_stdin(
-    timer: &tracking::TimedExecution,
+/// Inputs for one streamed-stdin invocation, grouped so the stream loop and
+/// its helpers share a single context instead of a long parameter list.
+struct StdinStream<'a> {
     engine: Engine,
-    extra_args: &[String],
-    patterns: &[String],
-    pattern_display: &str,
-    real_cmd: &str,
-    rtk_label: &str,
+    extra_args: &'a [String],
+    patterns: &'a [String],
+    pattern_display: &'a str,
+    real_cmd: &'a str,
+    rtk_label: &'a str,
     max_line_len: usize,
     max_results: usize,
     context_only: bool,
-) -> Result<i32> {
-    use std::io::{BufRead, BufReader, Write};
+}
 
-    let mut cmd = resolved_command(engine.bin());
-    cmd.args(engine.parse_flags());
-    for a in extra_args {
+fn spawn_stdin_engine(s: &StdinStream) -> Result<std::process::Child> {
+    let mut cmd = resolved_command(s.engine.bin());
+    cmd.args(s.engine.parse_flags());
+    for a in s.extra_args {
         cmd.arg(a);
     }
-    for p in patterns {
+    for p in s.patterns {
         cmd.args(["-e", p]);
     }
     cmd.arg("--");
     cmd.stdin(std::process::Stdio::inherit());
     cmd.stdout(std::process::Stdio::piped());
+    // Inherited stderr stays real-time and avoids a two-pipe read deadlock.
     cmd.stderr(std::process::Stdio::inherit());
+    cmd.spawn().context("failed to spawn search engine")
+}
 
-    let mut child = cmd.spawn().context("failed to spawn search engine")?;
+fn render_stream_line(
+    line: &str,
+    s: &StdinStream,
+    show_file: bool,
+    show_line: bool,
+    context_re: Option<&Regex>,
+) -> String {
+    match parse_match_line(line) {
+        Some((file, line_num, is_match, content)) => {
+            let cleaned = clean_line(content, s.max_line_len, context_re, s.pattern_display);
+            let sep = if is_match { ':' } else { '-' };
+            let mut r = String::new();
+            if show_file {
+                r.push_str(&compact_path(&file));
+                r.push(sep);
+            }
+            if show_line {
+                r.push_str(&line_num.to_string());
+                r.push(sep);
+            }
+            r.push_str(&cleaned);
+            r
+        }
+        // Shapes the parser doesn't know (context separators, engine notices)
+        // pass through verbatim, minus the --null parse aid.
+        None => line.replace('\0', ":"),
+    }
+}
+
+/// Streaming stdin mode: emit each match as it arrives instead of buffering to
+/// EOF. A pipeline like `tail -f log | rtk grep ERROR` must deliver output
+/// while the producer runs — capture-to-EOF returned nothing on kill where raw
+/// grep had already flushed its blocks (#2962 phase 2). No upfront header (the
+/// total is unknowable mid-stream); overflow gets a footer + tee hint at EOF.
+fn run_streamed_stdin(timer: &tracking::TimedExecution, s: &StdinStream) -> Result<i32> {
+    use std::io::{BufRead, BufReader, Write};
+
+    let mut child = spawn_stdin_engine(s)?;
     let Some(child_out) = child.stdout.take() else {
         let code = child.wait().map(status_to_exit_code).unwrap_or(1);
         return Ok(code);
     };
 
-    let context_re = if context_only {
+    let context_re = if s.context_only {
         Regex::new(&format!(
             "(?i).{{0,20}}{}.*",
-            regex::escape(pattern_display)
+            regex::escape(s.pattern_display)
         ))
         .ok()
     } else {
         None
     };
 
-    let show_file = has_short_flag(extra_args, 'H')
-        || has_short_flag(extra_args, 'r')
-        || has_short_flag(extra_args, 'R')
-        || extra_args
+    let show_file = has_short_flag(s.extra_args, 'H')
+        || has_short_flag(s.extra_args, 'r')
+        || has_short_flag(s.extra_args, 'R')
+        || s.extra_args
             .iter()
             .any(|f| f == "--with-filename" || f == "--recursive");
-    let show_line = !has_short_flag(extra_args, 'N')
-        && !extra_args.iter().any(|f| f == "--no-line-number");
+    let show_line = !has_short_flag(s.extra_args, 'N')
+        && !s.extra_args.iter().any(|f| f == "--no-line-number");
 
     // stdin is one pseudo-file: apply the same per-file cap as file mode.
-    let cap = max_results.min(config::limits().grep_max_per_file);
+    let cap = s.max_results.min(config::limits().grep_max_per_file);
 
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
     let mut emitted: usize = 0;
     let mut total: usize = 0;
-    let mut head: Vec<String> = Vec::new();
     let mut tee: Option<crate::core::tee::TeeStream> = None;
     let mut tracked = String::new();
     let mut output = String::new();
 
     for line in BufReader::new(child_out).lines() {
         let Ok(line) = line else { break };
-        let rendered = match parse_match_line(&line) {
-            Some((file, line_num, is_match, content)) => {
-                let cleaned =
-                    clean_line(content, max_line_len, context_re.as_ref(), pattern_display);
-                let sep = if is_match { ':' } else { '-' };
-                let mut r = String::new();
-                if show_file {
-                    r.push_str(&compact_path(&file));
-                    r.push(sep);
-                }
-                if show_line {
-                    r.push_str(&line_num.to_string());
-                    r.push(sep);
-                }
-                r.push_str(&cleaned);
-                r
-            }
-            // Shapes the parser doesn't know (context separators, engine
-            // notices) pass through verbatim, minus the --null parse aid.
-            None => line.replace('\0', ":"),
-        };
+        let rendered = render_stream_line(&line, s, show_file, show_line, context_re.as_ref());
         total += 1;
         if tracked.len() < STREAM_BUFFER_CAP {
             tracked.push_str(&rendered);
@@ -461,7 +475,6 @@ fn run_streamed_stdin(
         }
 
         if total <= cap {
-            head.push(rendered.clone());
             // Downstream closed early: stop emitting, never fail the command.
             if writeln!(out, "{}", rendered).is_err() {
                 break;
@@ -473,17 +486,16 @@ fn run_streamed_stdin(
         // Cap exceeded. The hint must be emitted NOW, not at an EOF that a
         // followed stream never reaches — a cap without a live recovery path
         // would silently mute the monitor (#2962). The tee file is written
-        // through (flushed per line) so it survives a killed pipeline.
+        // through (flushed per line) so it survives a killed pipeline; it is
+        // seeded from the tracking buffer, which still holds the full head
+        // (cap lines are far below STREAM_BUFFER_CAP).
         if total == cap + 1 {
-            tee = crate::core::tee::TeeStream::create(&format!("{}_stdin", engine.label()));
+            tee = crate::core::tee::TeeStream::create(&format!("{}_stdin", s.engine.label()));
             if let Some(ref mut t) = tee {
-                for h in &head {
+                for h in tracked.lines().take(cap) {
                     t.write_line(h);
                 }
-                let hint = format!(
-                    "  +more in (standard input) {}",
-                    t.tail_hint(emitted + 1)
-                );
+                let hint = format!("  +more in (standard input) {}", t.tail_hint(emitted + 1));
                 if writeln!(out, "{}", hint).is_err() {
                     break;
                 }
@@ -513,7 +525,7 @@ fn run_streamed_stdin(
         shown.push('\n');
     }
     shown.push_str(&output);
-    timer.track(real_cmd, rtk_label, &tracked, &shown);
+    timer.track(s.real_cmd, s.rtk_label, &tracked, &shown);
     Ok(exit_code)
 }
 
@@ -575,15 +587,17 @@ pub fn run(
     if stdin_only_paths(&paths) {
         return run_streamed_stdin(
             &timer,
-            engine,
-            &extra_args,
-            &patterns,
-            &pattern_display,
-            &real_cmd,
-            &rtk_label,
-            max_line_len,
-            max_results,
-            context_only,
+            &StdinStream {
+                engine,
+                extra_args: &extra_args,
+                patterns: &patterns,
+                pattern_display: &pattern_display,
+                real_cmd: &real_cmd,
+                rtk_label: &rtk_label,
+                max_line_len,
+                max_results,
+                context_only,
+            },
         );
     }
 
@@ -1606,5 +1620,49 @@ mod tests {
         assert!(f(&["--before-context=2"]));
         assert!(f(&["--context=1"]));
         assert!(!f(&["--color", "auto"]));
+    }
+
+    // --- streamed stdin mode (#2962) ---
+
+    #[test]
+    fn test_stdin_only_paths() {
+        assert!(stdin_only_paths(&[]));
+        assert!(stdin_only_paths(&["-".to_string()]));
+        assert!(!stdin_only_paths(&["file.txt".to_string()]));
+        assert!(!stdin_only_paths(&["-".to_string(), "file.txt".to_string()]));
+    }
+
+    #[test]
+    fn test_render_stream_line() {
+        let s = StdinStream {
+            engine: Engine::Grep,
+            extra_args: &[],
+            patterns: &[],
+            pattern_display: "match",
+            real_cmd: "grep match",
+            rtk_label: "rtk grep",
+            max_line_len: 80,
+            max_results: 200,
+            context_only: false,
+        };
+        assert_eq!(
+            render_stream_line("(standard input)\u{0}7:match here", &s, false, true, None),
+            "7:match here"
+        );
+        assert_eq!(
+            render_stream_line("(standard input)\u{0}8-context here", &s, false, true, None),
+            "8-context here"
+        );
+        assert_eq!(
+            render_stream_line("(standard input)\u{0}7:match here", &s, false, false, None),
+            "match here"
+        );
+        // Unparsed shapes (context separators, engine notices) pass through
+        // verbatim, minus the --null parse aid.
+        assert_eq!(render_stream_line("--", &s, false, true, None), "--");
+        assert_eq!(
+            render_stream_line("odd\u{0}shape", &s, false, true, None),
+            "odd:shape"
+        );
     }
 }

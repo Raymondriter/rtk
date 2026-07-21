@@ -599,30 +599,48 @@ pub fn rewrite_command(
 /// wrapper layers as `rewrite_segment_inner` (sudo/env/VAR=, shell builtins,
 /// user transparent_prefixes, absolute paths) so eligibility checks cannot be
 /// bypassed by `command grep …`, `sudo grep …`, or `/usr/bin/grep …` (#2962).
-fn resolve_stage_command(seg: &str, transparent_prefixes: &[String]) -> String {
-    let mut current = seg.trim().to_string();
+fn resolve_stage_command<'a>(seg: &'a str, transparent_prefixes: &[String]) -> &'a str {
+    let mut current = seg.trim();
     for _ in 0..MAX_PREFIX_DEPTH {
-        let stripped = ENV_PREFIX.replace(&current, "").trim().to_string();
-        let mut next = stripped;
-        for &prefix in BUILTIN_TRANSPARENT_PREFIXES {
-            if let Some(rest) = strip_word_prefix(&next, prefix) {
-                next = rest.trim().to_string();
-                break;
+        let mut next = current;
+        if let Some(m) = ENV_PREFIX.find(next) {
+            next = next[m.end()..].trim_start();
+        }
+        if let Some(rest) = strip_one_wrapper(next, transparent_prefixes) {
+            next = rest.trim_start();
+        }
+        // Same contract as `strip_absolute_path`, as a suffix slice: the
+        // basename of a path-qualified head word, kept whole on a bare `/`.
+        let first = next.split(char::is_whitespace).next().unwrap_or("");
+        if let Some(pos) = first.rfind('/') {
+            if pos + 1 < first.len() {
+                next = &next[pos + 1..];
             }
         }
-        for prefix in transparent_prefixes {
-            if let Some(rest) = strip_word_prefix(&next, prefix) {
-                next = rest.trim().to_string();
-                break;
-            }
-        }
-        next = strip_absolute_path(&next);
         if next == current {
             break;
         }
         current = next;
     }
     current
+}
+
+/// One wrapper layer (shell builtin, then user transparent prefix) stripped
+/// from the front of `cmd`. Single source of truth shared by
+/// `rewrite_segment_inner` and `resolve_stage_command` so the rewriter and the
+/// pipe-stage eligibility checks can never disagree on what a wrapper is.
+fn strip_one_wrapper<'a>(cmd: &'a str, transparent_prefixes: &[String]) -> Option<&'a str> {
+    for &prefix in BUILTIN_TRANSPARENT_PREFIXES {
+        if let Some(rest) = strip_word_prefix(cmd, prefix) {
+            return Some(rest);
+        }
+    }
+    for prefix in transparent_prefixes {
+        if let Some(rest) = strip_word_prefix(cmd, prefix) {
+            return Some(rest);
+        }
+    }
+    None
 }
 
 /// A pipe stage is display-only when it bounds or forwards its stdin for the
@@ -965,26 +983,15 @@ fn rewrite_segment_inner(
         return Some(format!("{}{}", env_prefix, rewritten));
     }
 
-    for &prefix in BUILTIN_TRANSPARENT_PREFIXES {
-        if let Some(rest) = strip_word_prefix(trimmed, prefix) {
-            if rest.is_empty() {
-                return None;
-            }
-            return rewrite_segment_inner(rest, excluded, transparent_prefixes, depth + 1)
-                .map(|rewritten| format!("{} {}", prefix, rewritten));
+    // Wrapper prefixes (shell builtins, then user transparent prefixes):
+    // strip, recurse, re-prepend the original prefix text.
+    if let Some(rest) = strip_one_wrapper(trimmed, transparent_prefixes) {
+        if rest.is_empty() {
+            return None;
         }
-    }
-
-    // User-configured wrapper prefixes (e.g. `docker exec mycontainer`). Same
-    // strip-recurse-reprepend contract as the builtin list above.
-    for prefix in transparent_prefixes {
-        if let Some(rest) = strip_word_prefix(trimmed, prefix) {
-            if rest.is_empty() {
-                return None;
-            }
-            return rewrite_segment_inner(rest, excluded, transparent_prefixes, depth + 1)
-                .map(|rewritten| format!("{} {}", prefix, rewritten));
-        }
+        let prefix = trimmed[..trimmed.len() - rest.len()].trim_end();
+        return rewrite_segment_inner(rest, excluded, transparent_prefixes, depth + 1)
+            .map(|rewritten| format!("{} {}", prefix, rewritten));
     }
 
     // Strip trailing stderr/stdout redirects before matching (#530)
