@@ -13,7 +13,7 @@ fn rtk() -> Command {
     c
 }
 
-fn run_with_stdin(args: &[&str], input: &str) -> (String, i32) {
+fn run_with_stdin_bytes(args: &[&str], input: &[u8]) -> (String, i32) {
     let mut child = rtk()
         .args(args)
         .stdin(Stdio::piped())
@@ -25,13 +25,17 @@ fn run_with_stdin(args: &[&str], input: &str) -> (String, i32) {
         .stdin
         .take()
         .expect("child stdin")
-        .write_all(input.as_bytes())
+        .write_all(input)
         .expect("write stdin");
     let out = child.wait_with_output().expect("wait rtk");
     (
         String::from_utf8_lossy(&out.stdout).into_owned(),
         out.status.code().unwrap_or(-1),
     )
+}
+
+fn run_with_stdin(args: &[&str], input: &str) -> (String, i32) {
+    run_with_stdin_bytes(args, input.as_bytes())
 }
 
 #[test]
@@ -53,6 +57,27 @@ fn stdin_grep_small_stream_uncapped_no_hint() {
     assert_eq!(code, 0);
     assert_eq!(stdout.lines().count(), 2);
     assert!(!stdout.contains("+more"));
+}
+
+#[test]
+fn stdin_grep_non_utf8_line_does_not_abort_stream() {
+    // A single invalid byte used to end the stream: 1 of 3 lines delivered
+    // with exit 0.
+    let (stdout, code) = run_with_stdin_bytes(
+        &["grep", "-a", "match"],
+        b"match A\nmatch B \xff\nmatch C\n",
+    );
+    assert_eq!(code, 0);
+    assert_eq!(stdout.lines().count(), 3, "got:\n{}", stdout);
+    assert!(stdout.contains("match C"));
+}
+
+#[test]
+fn stdin_grep_binary_stream_keeps_engine_exit_code() {
+    // Forcing -I flipped this to silence + exit 1; real grep reports the
+    // match and exits 0.
+    let (_, code) = run_with_stdin_bytes(&["grep", "match"], b"some match\x00data\n");
+    assert_eq!(code, 0);
 }
 
 #[test]

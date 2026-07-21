@@ -287,6 +287,16 @@ impl Engine {
             Engine::Rg => &["-n", "--with-filename", "--null"],
         }
     }
+
+    /// Stdin is one explicit input, not a tree to skim: forcing `-I` there
+    /// flipped binary-stream exit codes (silence + 1 where grep reports the
+    /// match + 0).
+    fn stdin_parse_flags(self) -> &'static [&'static str] {
+        match self {
+            Engine::Grep => &["-n", "-H", "--null"],
+            Engine::Rg => &["-n", "--with-filename", "--null"],
+        }
+    }
 }
 
 /// Runs the agent's exact engine + flags for the grouping path, appending only the
@@ -374,7 +384,7 @@ struct StdinStream<'a> {
 
 fn spawn_stdin_engine(s: &StdinStream) -> Result<std::process::Child> {
     let mut cmd = resolved_command(s.engine.bin());
-    cmd.args(s.engine.parse_flags());
+    cmd.args(s.engine.stdin_parse_flags());
     for a in s.extra_args {
         cmd.arg(a);
     }
@@ -419,7 +429,8 @@ fn render_stream_line(
 
 /// Emits each match as it arrives: capture-to-EOF delivered nothing when a
 /// pipeline like `tail -f log | rtk grep ERROR` was killed (#2962). No upfront
-/// header — the total is unknowable mid-stream.
+/// header — the total is unknowable mid-stream, which also means the
+/// never-worse output guard cannot apply here.
 fn run_streamed_stdin(timer: &tracking::TimedExecution, s: &StdinStream) -> Result<i32> {
     use std::io::{BufRead, BufReader, Write};
 
@@ -453,18 +464,36 @@ fn run_streamed_stdin(timer: &tracking::TimedExecution, s: &StdinStream) -> Resu
 
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
+    let mut reader = BufReader::new(child_out);
+    let mut buf: Vec<u8> = Vec::new();
     let mut emitted: usize = 0;
     let mut total: usize = 0;
     let mut tee: Option<crate::core::tee::TeeStream> = None;
     let mut tracked = String::new();
     let mut output = String::new();
 
-    for line in BufReader::new(child_out).lines() {
-        let Ok(line) = line else { break };
+    loop {
+        buf.clear();
+        // Byte-level read + lossy decode, matching the capture path's
+        // from_utf8_lossy: one non-UTF-8 line must not abort the stream.
+        match reader.read_until(b'\n', &mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
+        }
+        if buf.last() == Some(&b'\n') {
+            buf.pop();
+            if buf.last() == Some(&b'\r') {
+                buf.pop();
+            }
+        }
+        let line = String::from_utf8_lossy(&buf);
+        // The tee and savings baseline hold what the engine printed
+        // (parse aid normalized), not the compacted render.
+        let raw = line.replace('\0', ":");
         let rendered = render_stream_line(&line, s, show_file, show_line, context_re.as_ref());
         total += 1;
         if tracked.len() < STREAM_BUFFER_CAP {
-            tracked.push_str(&rendered);
+            tracked.push_str(&raw);
             tracked.push('\n');
         }
 
@@ -474,6 +503,10 @@ fn run_streamed_stdin(timer: &tracking::TimedExecution, s: &StdinStream) -> Resu
                 break;
             }
             emitted += 1;
+            if output.len() < STREAM_BUFFER_CAP {
+                output.push_str(&rendered);
+                output.push('\n');
+            }
             continue;
         }
 
@@ -495,13 +528,17 @@ fn run_streamed_stdin(timer: &tracking::TimedExecution, s: &StdinStream) -> Resu
             }
         }
         match tee {
-            Some(ref mut t) => t.write_line(&rendered),
+            Some(ref mut t) => t.write_line(&raw),
             // No tee means no recovery path, so capping would hide data.
             None => {
                 if writeln!(out, "{}", rendered).is_err() {
                     break;
                 }
                 emitted += 1;
+                if output.len() < STREAM_BUFFER_CAP {
+                    output.push_str(&rendered);
+                    output.push('\n');
+                }
             }
         }
     }
@@ -509,12 +546,7 @@ fn run_streamed_stdin(timer: &tracking::TimedExecution, s: &StdinStream) -> Resu
 
     let exit_code = child.wait().map(status_to_exit_code).unwrap_or(1);
 
-    let mut shown: String = tracked.lines().take(emitted).collect::<Vec<_>>().join("\n");
-    if !shown.is_empty() {
-        shown.push('\n');
-    }
-    shown.push_str(&output);
-    timer.track(s.real_cmd, s.rtk_label, &tracked, &shown);
+    timer.track(s.real_cmd, s.rtk_label, &tracked, &output);
     Ok(exit_code)
 }
 

@@ -118,6 +118,17 @@ mod tests {
         }
 
         #[test]
+        fn test_pipe_inside_substitution_passthrough() {
+            // Load-bearing for final-stage pipe rewrites: inside $(...) the
+            // pipeline feeds the shell, not the agent, so this guard is what
+            // keeps `rtk grep`'s reshaped output out of substitutions.
+            assert_eq!(
+                evaluate("echo $(git log | grep fix)", &[], &[]),
+                RewriteOutcome::Passthrough
+            );
+        }
+
+        #[test]
         fn test_file_redirect_passthrough() {
             assert_eq!(
                 evaluate("git log > /tmp/out.txt", &[], &[]),
