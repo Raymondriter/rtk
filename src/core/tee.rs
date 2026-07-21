@@ -598,6 +598,7 @@ directory = "/tmp/rtk-tee"
         let hint = t.tail_hint(2);
         assert!(hint.starts_with("[see remaining: tail -n +2 "));
         assert!(hint.ends_with(']'));
+        // nosemgrep: filesystem-deletion
         let _ = std::fs::remove_file(&path);
     }
 
@@ -613,6 +614,7 @@ directory = "/tmp/rtk-tee"
         assert!(content.contains("truncated at 9 bytes"));
         assert!(!content.contains("overflow line"));
         assert!(!content.contains("ignored after cap"));
+        // nosemgrep: filesystem-deletion
         let _ = std::fs::remove_file(&path);
     }
 }
