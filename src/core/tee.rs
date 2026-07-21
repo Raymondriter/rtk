@@ -188,8 +188,6 @@ pub fn tee_and_hint(raw: &str, command_slug: &str, exit_code: i32) -> Option<Str
     Some(format_hint(&path))
 }
 
-/// Shared gate for the force-tee paths: env kill-switch, config enabled flag,
-/// and a created, writable tee directory.
 fn enabled_tee_dir() -> Option<(Config, PathBuf)> {
     if std::env::var("RTK_TEE").ok().as_deref() == Some("0") {
         return None;
@@ -237,9 +235,8 @@ pub fn force_tee_tail_hint(
     ))
 }
 
-/// Write-through tee for streamed output: each line is flushed as it arrives,
-/// so the recovery file survives a killed pipeline — a buffered tee written at
-/// EOF loses everything when `tail -f … | rtk grep` is interrupted (#2962).
+/// Write-through tee: each line is flushed on arrival so the recovery file
+/// survives a killed pipeline (#2962).
 pub struct TeeStream {
     file: std::fs::File,
     path: PathBuf,
@@ -249,7 +246,6 @@ pub struct TeeStream {
 }
 
 impl TeeStream {
-    /// Same gates as `force_tee_hint`: RTK_TEE=0, `tee.enabled`, resolvable dir.
     pub fn create(command_slug: &str) -> Option<TeeStream> {
         let (config, tee_dir) = enabled_tee_dir()?;
         let epoch = std::time::SystemTime::now()
@@ -273,8 +269,6 @@ impl TeeStream {
         })
     }
 
-    /// Append one line and flush immediately. Stops at `max_file_size` with a
-    /// truncation marker, mirroring `write_tee_file`.
     pub fn write_line(&mut self, line: &str) {
         use std::io::Write;
         if self.capped {
@@ -292,7 +286,6 @@ impl TeeStream {
         }
     }
 
-    /// Same shape as `force_tee_tail_hint`'s return.
     pub fn tail_hint(&self, line_offset: usize) -> String {
         format!(
             "[see remaining: tail -n +{} {}]",

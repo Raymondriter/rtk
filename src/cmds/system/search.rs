@@ -353,16 +353,13 @@ fn has_context_flag(flags: &[String]) -> bool {
         })
 }
 
-/// Bound on the tracking buffer kept while streaming stdin — metrics are
-/// best-effort on unbounded input; memory stays flat (<5MB target).
+/// Tracking-metrics buffer bound: best-effort on unbounded stdin.
 const STREAM_BUFFER_CAP: usize = 65_536;
 
 fn stdin_only_paths(paths: &[String]) -> bool {
     paths.is_empty() || paths.iter().all(|p| p == "-")
 }
 
-/// Inputs for one streamed-stdin invocation, grouped so the stream loop and
-/// its helpers share a single context instead of a long parameter list.
 struct StdinStream<'a> {
     engine: Engine,
     extra_args: &'a [String],
@@ -415,17 +412,14 @@ fn render_stream_line(
             r.push_str(&cleaned);
             r
         }
-        // Shapes the parser doesn't know (context separators, engine notices)
-        // pass through verbatim, minus the --null parse aid.
+        // Unknown shapes pass through verbatim, minus the --null parse aid.
         None => line.replace('\0', ":"),
     }
 }
 
-/// Streaming stdin mode: emit each match as it arrives instead of buffering to
-/// EOF. A pipeline like `tail -f log | rtk grep ERROR` must deliver output
-/// while the producer runs — capture-to-EOF returned nothing on kill where raw
-/// grep had already flushed its blocks (#2962 phase 2). No upfront header (the
-/// total is unknowable mid-stream); overflow gets a footer + tee hint at EOF.
+/// Emits each match as it arrives: capture-to-EOF delivered nothing when a
+/// pipeline like `tail -f log | rtk grep ERROR` was killed (#2962). No upfront
+/// header — the total is unknowable mid-stream.
 fn run_streamed_stdin(timer: &tracking::TimedExecution, s: &StdinStream) -> Result<i32> {
     use std::io::{BufRead, BufReader, Write};
 
@@ -483,12 +477,8 @@ fn run_streamed_stdin(timer: &tracking::TimedExecution, s: &StdinStream) -> Resu
             continue;
         }
 
-        // Cap exceeded. The hint must be emitted NOW, not at an EOF that a
-        // followed stream never reaches — a cap without a live recovery path
-        // would silently mute the monitor (#2962). The tee file is written
-        // through (flushed per line) so it survives a killed pipeline; it is
-        // seeded from the tracking buffer, which still holds the full head
-        // (cap lines are far below STREAM_BUFFER_CAP).
+        // The hint must go out at cap time — a followed stream never reaches
+        // EOF, and a cap without a live recovery path mutes the monitor.
         if total == cap + 1 {
             tee = crate::core::tee::TeeStream::create(&format!("{}_stdin", s.engine.label()));
             if let Some(ref mut t) = tee {
@@ -506,8 +496,7 @@ fn run_streamed_stdin(timer: &tracking::TimedExecution, s: &StdinStream) -> Resu
         }
         match tee {
             Some(ref mut t) => t.write_line(&rendered),
-            // Tee unavailable: capping would hide data with no recovery path,
-            // so stream everything instead (correctness over savings).
+            // No tee means no recovery path, so capping would hide data.
             None => {
                 if writeln!(out, "{}", rendered).is_err() {
                     break;

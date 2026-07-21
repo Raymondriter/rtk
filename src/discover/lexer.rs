@@ -119,8 +119,7 @@ fn tokenize_inner(input: &str, emit_newline: bool) -> Vec<ParsedToken> {
                         offset: start,
                     });
                 } else if chars.peek() == Some(&'&') {
-                    // `|&` is bash's stderr-merging pipe; tokenizing the `&` separately
-                    // made rewrite_compound emit `| &` — a shell syntax error.
+                    // Tokenizing `|&` as pipe + `&` made the rewriter emit `| &`.
                     chars.next();
                     byte_pos += 1;
                     tokens.push(ParsedToken {

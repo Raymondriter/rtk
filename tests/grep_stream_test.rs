@@ -65,17 +65,16 @@ fn stdin_grep_exit_codes_preserved() {
     assert_eq!(code, 0);
 }
 
-/// The regression that motivated streaming: a killed pipeline must still have
-/// delivered the capped head + hint (buffer-to-EOF delivered nothing), and the
-/// write-through tee must hold the overflow that arrived before the kill.
+/// A killed pipeline must still have delivered the capped head + hint, and
+/// the write-through tee must hold the overflow (buffer-to-EOF delivered
+/// nothing, #2962).
 #[cfg(unix)]
 #[test]
 #[ignore] // timing-sensitive; run with: cargo test --ignored
 fn stdin_grep_delivers_before_eof_and_tee_survives_kill() {
     let tee_dir = std::env::temp_dir().join(format!("rtk_stream_kill_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&tee_dir);
-    // Page the binary in first: a cold start on a slow filesystem must not
-    // consume the kill window.
+    // Page the binary in so a cold start cannot consume the kill window.
     let _ = Command::new(env!("CARGO_BIN_EXE_rtk"))
         .arg("--version")
         .output();
@@ -106,8 +105,7 @@ fn stdin_grep_delivers_before_eof_and_tee_survives_kill() {
         .collect();
     assert_eq!(tee_files.len(), 1, "one write-through tee file expected");
     let tee = std::fs::read_to_string(tee_files[0].path()).expect("tee content");
-    // Strictly more lines than the emitted cap proves overflow was written
-    // through while streaming (exact counts vary with host timing).
+    // More lines than the emitted cap proves write-through of the overflow.
     assert!(
         tee.lines().count() > 25,
         "tee must capture overflow while streaming, got {} lines",
