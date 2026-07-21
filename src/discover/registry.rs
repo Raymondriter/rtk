@@ -643,27 +643,55 @@ fn is_display_only_stage(seg: &str, transparent_prefixes: &[String]) -> bool {
     }
 }
 
-/// True when every stage after the pipe at `pipe_offset` (up to `group_end`)
-/// is display-only, meaning the producer's rtk-shaped output still reaches the
-/// agent unparsed and its rewrite is safe. Any content-consuming stage (`wc`,
-/// `xargs`, `grep`, …) means the producer must stay raw (#2962, #1560, #439).
-fn pipe_tail_display_only(
-    cmd: &str,
+/// Pipe-final commands whose rtk filter reads stdin, streams instead of
+/// buffering to EOF, and preserves the engine's exit codes — safe to receive a
+/// raw pipeline's output in the agent-facing position. The pipeline's final
+/// stdout goes to the agent, so this is where filtering saves tokens without
+/// corrupting any program. Grown deliberately, one verified entry at a time.
+const STDIN_SAFE_FINAL: &[&str] = &["grep", "rg"];
+
+fn is_stdin_safe_final_stage(seg: &str, transparent_prefixes: &[String]) -> bool {
+    let resolved = resolve_stage_command(seg, transparent_prefixes);
+    let cmd = resolved.split_whitespace().next().unwrap_or("");
+    STDIN_SAFE_FINAL.contains(&cmd)
+}
+
+/// Byte spans of each stage after a pipe in `cmd[pipe_offset..group_end]`,
+/// one per pipe token (the producer before the first pipe is not included).
+fn pipe_group_stage_spans(
     tokens: &[ParsedToken],
     pipe_offset: usize,
     group_end: usize,
-    transparent_prefixes: &[String],
-) -> bool {
+) -> Vec<(usize, usize)> {
     let pipes: Vec<&ParsedToken> = tokens
         .iter()
         .filter(|t| t.kind == TokenKind::Pipe && t.offset >= pipe_offset && t.offset < group_end)
         .collect();
-    pipes.iter().enumerate().all(|(i, p)| {
-        let start = p.offset + p.value.len();
-        let end = pipes.get(i + 1).map(|n| n.offset).unwrap_or(group_end);
-        let stage = cmd[start..end].trim();
-        !stage.is_empty() && is_display_only_stage(stage, transparent_prefixes)
-    })
+    pipes
+        .iter()
+        .enumerate()
+        .map(|(i, p)| {
+            let start = p.offset + p.value.len();
+            let end = pipes.get(i + 1).map(|n| n.offset).unwrap_or(group_end);
+            (start, end)
+        })
+        .collect()
+}
+
+/// True when every stage after the pipe is display-only, meaning the
+/// producer's rtk-shaped output still reaches the agent unparsed and its
+/// rewrite is safe. Any content-consuming stage (`wc`, `xargs`, `grep`, …)
+/// means the producer must stay raw (#2962, #1560, #439).
+fn pipe_tail_display_only(
+    cmd: &str,
+    spans: &[(usize, usize)],
+    transparent_prefixes: &[String],
+) -> bool {
+    !spans.is_empty()
+        && spans.iter().all(|&(start, end)| {
+            let stage = cmd[start..end].trim();
+            !stage.is_empty() && is_display_only_stage(stage, transparent_prefixes)
+        })
 }
 
 /// Rewrite a compound command (with `&&`, `||`, `;`, `|`) by rewriting each segment.
@@ -720,13 +748,9 @@ fn rewrite_compound(
                 // #439). Rewrite only when every downstream stage is
                 // display-only, so the agent is still the real reader.
                 let group_end_off = pipe_group_end.map(|t| t.offset).unwrap_or(cmd.len());
-                let rewritten = if pipe_tail_display_only(
-                    cmd,
-                    &tokens,
-                    tok.offset,
-                    group_end_off,
-                    transparent_prefixes,
-                ) {
+                let spans = pipe_group_stage_spans(&tokens, tok.offset, group_end_off);
+                let all_display = pipe_tail_display_only(cmd, &spans, transparent_prefixes);
+                let rewritten = if all_display {
                     rewrite_segment(seg, excluded, transparent_prefixes)
                         .unwrap_or_else(|| seg.to_string())
                 } else {
@@ -737,15 +761,44 @@ fn rewrite_compound(
                 }
                 result.push_str(&rewritten);
 
+                // The FINAL stage's stdout is what the agent reads — filtering
+                // there saves tokens without corrupting any program, so it is
+                // rewritten when its filter is declared stdin-safe (streams,
+                // preserves exit codes). Intermediate stages always stay raw.
+                let mut tail: Option<String> = None;
+                if !all_display {
+                    if let Some(&(fs, fe)) = spans.last() {
+                        let final_seg = cmd[fs..fe].trim();
+                        if !final_seg.is_empty()
+                            && is_stdin_safe_final_stage(final_seg, transparent_prefixes)
+                        {
+                            if let Some(rf) =
+                                rewrite_segment(final_seg, excluded, transparent_prefixes)
+                            {
+                                if rf != final_seg {
+                                    tail = Some(format!("{} {}", cmd[tok.offset..fs].trim(), rf));
+                                    any_changed = true;
+                                }
+                            }
+                        }
+                    }
+                }
+
                 match pipe_group_end {
                     Some(next_op) => {
                         result.push(' ');
-                        result.push_str(cmd[tok.offset..next_op.offset].trim());
+                        match tail {
+                            Some(t) => result.push_str(&t),
+                            None => result.push_str(cmd[tok.offset..next_op.offset].trim()),
+                        }
                         seg_start = next_op.offset;
                     }
                     None => {
                         result.push(' ');
-                        result.push_str(cmd[tok.offset..].trim_start());
+                        match tail {
+                            Some(t) => result.push_str(&t),
+                            None => result.push_str(cmd[tok.offset..].trim_start()),
+                        }
                         return if any_changed { Some(result) } else { None };
                     }
                 }
@@ -1772,11 +1825,12 @@ mod tests {
 
     #[test]
     fn test_rewrite_pipe_first_only() {
-        // A content-consuming pipe tail keeps the producer raw (#2962); a
-        // display-only tail keeps the producer rewrite and its savings.
+        // A content-consuming pipe tail keeps the producer raw (#2962); the
+        // final agent-facing stage rewrites when stdin-safe. A display-only
+        // tail keeps the producer rewrite and its savings.
         assert_eq!(
             rewrite_command_no_prefixes("git log -10 | grep feat", &[]),
-            None
+            Some("git log -10 | rtk grep feat".into())
         );
         assert_eq!(
             rewrite_command_no_prefixes("git log -10 | head -5", &[]),
@@ -3633,11 +3687,12 @@ mod tests {
 
     #[test]
     fn test_rewrite_compound_pipe_raw_filter() {
-        // grep parses the producer's stdout: rtk cargo's reshaped output would
-        // corrupt it, so the whole pipeline stays raw (#2962/#1560).
+        // The producer stays raw (rtk cargo's reshaped output would corrupt
+        // grep's input, #2962/#1560); the final stage is agent-facing and
+        // grep's filter is stdin-safe, so it is rewritten.
         assert_eq!(
             rewrite_command_no_prefixes("cargo test | grep FAILED", &[]),
-            None
+            Some("cargo test | rtk grep FAILED".into())
         );
     }
 
@@ -3645,7 +3700,7 @@ mod tests {
     fn test_rewrite_compound_pipe_git_grep() {
         assert_eq!(
             rewrite_command_no_prefixes("git log -10 | grep feat", &[]),
-            None
+            Some("git log -10 | rtk grep feat".into())
         );
     }
 
@@ -4379,17 +4434,73 @@ mod tests {
     fn test_rewrite_pipe_content_consumers_stay_raw() {
         // Each consumer parses the producer's stdout; rtk's reshaped output
         // corrupted them (grep|wc counted 28 for 60 real matches, #2962).
+        // The final stage here is not stdin-safe, so nothing rewrites.
         for cmd in [
             "grep -n match sixty.txt | wc -l",
             "git status --short | wc -l",
-            "git branch | grep feat",
-            "ls -la | grep rs",
-            "cat f.txt | grep x",
             "git diff --name-only | xargs wc -l",
-            "ps aux | grep python",
+            "find . -name '*.rs' | xargs grep TODO",
         ] {
             assert_eq!(rewrite_command_no_prefixes(cmd, &[]), None, "cmd: {cmd}");
         }
+    }
+
+    #[test]
+    fn test_rewrite_pipe_final_grep_rewritten() {
+        // Producer raw; the final stage's stdout goes to the agent, and grep's
+        // stdin filter streams and preserves exit codes — so it rewrites.
+        for (cmd, expected) in [
+            ("git branch | grep feat", "git branch | rtk grep feat"),
+            ("ls -la | grep rs", "ls -la | rtk grep rs"),
+            ("cat f.txt | grep x", "cat f.txt | rtk grep x"),
+            ("ps aux | grep python", "ps aux | rtk grep python"),
+            ("cargo test | rg FAIL", "cargo test | rtk rg FAIL"),
+            ("grep a f.txt | grep b", "grep a f.txt | rtk grep b"),
+            (
+                "git log | head -5 | grep fix",
+                "git log | head -5 | rtk grep fix",
+            ),
+            (
+                "tail -f app.log | grep ERROR",
+                "tail -f app.log | rtk grep ERROR",
+            ),
+            ("make 2>&1 |& grep error", "make 2>&1 |& rtk grep error"),
+            (
+                "git log | command grep fix",
+                "git log | command rtk grep fix",
+            ),
+            ("git log | sudo grep fix", "git log | sudo rtk grep fix"),
+        ] {
+            assert_eq!(
+                rewrite_command_no_prefixes(cmd, &[]),
+                Some(expected.into()),
+                "cmd: {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_rewrite_pipe_final_grep_multi_group() {
+        assert_eq!(
+            rewrite_command_no_prefixes("git log | grep a && ls | grep b", &[]),
+            Some("git log | rtk grep a && ls | rtk grep b".into())
+        );
+    }
+
+    #[test]
+    fn test_rewrite_pipe_final_grep_respects_exclusions() {
+        let excluded = vec!["grep".to_string()];
+        assert_eq!(
+            rewrite_command_no_prefixes("git log | grep fix", &excluded),
+            None
+        );
+    }
+
+    #[test]
+    fn test_rewrite_pipe_final_bare_grep_not_rewritten() {
+        // `grep` with no args matches no rule (pattern needs a following arg);
+        // the pipeline is left alone rather than force-rewritten.
+        assert_eq!(rewrite_command_no_prefixes("git log | grep", &[]), None);
     }
 
     #[test]
@@ -4532,10 +4643,10 @@ mod tests {
 
     #[test]
     fn test_rewrite_pipe_then_or() {
-        // Producer stays raw before grep; the segment after || still rewrites.
+        // Producer raw, final grep rewritten, segment after || still rewrites.
         assert_eq!(
             rewrite_command_no_prefixes("cargo test | grep FAIL || git stash", &[]),
-            Some("cargo test | grep FAIL || rtk git stash".into())
+            Some("cargo test | rtk grep FAIL || rtk git stash".into())
         );
     }
 
@@ -4546,7 +4657,7 @@ mod tests {
                 "RUST_BACKTRACE=1 cargo test 2>&1 | grep FAILED && git stash",
                 &[]
             ),
-            Some("RUST_BACKTRACE=1 cargo test 2>&1 | grep FAILED && rtk git stash".into())
+            Some("RUST_BACKTRACE=1 cargo test 2>&1 | rtk grep FAILED && rtk git stash".into())
         );
     }
 
@@ -4554,7 +4665,7 @@ mod tests {
     fn test_rewrite_and_then_pipe() {
         assert_eq!(
             rewrite_command_no_prefixes("git status && cargo test | grep FAIL", &[]),
-            Some("rtk git status && cargo test | grep FAIL".into())
+            Some("rtk git status && cargo test | rtk grep FAIL".into())
         );
     }
 

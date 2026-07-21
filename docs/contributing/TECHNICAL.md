@@ -142,7 +142,8 @@ rewrite_compound(cmd, excluded)                    [src/discover/registry.rs]
   |  Step 2 — Split on operators, rewrite each segment
   |  Operator (&&, ||, ;) → rewrite both sides
   |  Pipe (|, |&) → producer rewritten only if all downstream stages
-  |                 are display-only (head/tail/cat); consumers stay raw
+  |                 are display-only (head/tail/cat); final stage
+  |                 rewritten if stdin-safe (grep/rg); middle stays raw
   |  Shellism (&) → rewrite both sides (background)
   |
   |  Calls rewrite_segment() per segment:
@@ -205,7 +206,7 @@ LLM Agent executes rewritten command
 Key design decisions:
 - **Lexer-based tokenization**: A single-pass state machine (`lexer.rs`) handles all shell constructs (quotes, escapes, redirects, operators). Used for both compound splitting and redirect stripping.
 - **Segment-level rewriting**: Compound commands are split by operators, each segment rewritten independently. Bash recombines them at execution time.
-- **Pipe semantics**: Pipe consumers always run raw. The producer is rewritten only when every downstream stage is display-only (`head`, `tail` without follow, `cat`) — otherwise rtk's reshaped output would feed a program that parses it (`grep | wc -l` miscounted, #2962; `find | xargs`, #439) and the producer stays raw.
+- **Pipe semantics**: The producer is rewritten only when every downstream stage is display-only (`head`, `tail` without follow, `cat`) — otherwise rtk's reshaped output would feed a program that parses it (`grep | wc -l` miscounted, #2962; `find | xargs`, #439) and the producer stays raw. The final stage — agent-facing stdout — is rewritten when its filter is stdin-safe (`STDIN_SAFE_FINAL`: `grep`, `rg`); intermediate stages always run raw.
 - **Double env prefix handling**: `classify_command()` strips env prefixes to match the underlying command against rules. `rewrite_segment()` extracts the same prefix separately to re-prepend it to the rewritten command.
 - **Fallback contract**: If any segment fails to match, it stays raw. `rewrite_command()` returns `None` only when zero segments were rewritten.
 
