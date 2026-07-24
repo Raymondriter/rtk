@@ -7,12 +7,15 @@
 
 use super::utils::{php_tool_command, strip_ansi_and_controls};
 use crate::core::runner;
+use crate::core::utils::fallback_tail;
 use anyhow::Result;
 use lazy_static::lazy_static;
 use regex::Regex;
 
 const MAX_FAILURES_SHOWN: usize = 10;
 const MAX_DETAIL_LINES_PER_FAILURE: usize = 2;
+/// Tail size when PHPUnit's output shape isn't recognized (crash, fatal error).
+const MAX_FALLBACK_LINES: usize = 20;
 
 lazy_static! {
     // PHPUnit prints each failure heading as "N) Class::method". Anchor to that
@@ -36,7 +39,9 @@ pub fn run(args: &[String], verbose: u8) -> Result<i32> {
         "phpunit",
         &args.join(" "),
         filter_phpunit_output,
-        runner::RunOptions::stdout_only().tee("phpunit"),
+        // Filter stdout+stderr, not stdout alone: PHP fatals and bootstrap
+        // errors go to stderr, and stdout_only would drop them entirely.
+        runner::RunOptions::with_tee("phpunit"),
     )
 }
 
@@ -100,6 +105,13 @@ pub(crate) fn filter_phpunit_output(output: &str) -> String {
                 "PHPUnit: {} tests, {} assertions",
                 counts.tests, counts.assertions
             );
+        }
+        // No failure blocks and no "Tests:" summary means PHPUnit never reached
+        // its result line (fatal error, bootstrap failure, crashed run). Saying
+        // "ok" there asserts success over a crash and drops the only diagnostic
+        // the caller has, so surface the tail instead.
+        if !output.trim().is_empty() {
+            return fallback_tail(output, "phpunit", MAX_FALLBACK_LINES);
         }
         return "PHPUnit: ok".to_string();
     }
@@ -374,6 +386,59 @@ Tests: 1, Assertions: 0, Errors: 1."#;
     fn test_phpunit_empty_ok_fallback() {
         let result = filter_phpunit_output("");
         assert_eq!(result, "PHPUnit: ok");
+    }
+
+    #[test]
+    fn test_phpunit_fatal_error_is_not_reported_as_ok() {
+        let crash = "PHP Fatal error:  Uncaught Error: Class \"Foo\" not found in \
+                     /app/tests/BarTest.php:12\nStack trace:\n#0 {main}\n  \
+                     thrown in /app/tests/BarTest.php on line 12";
+        let result = filter_phpunit_output(crash);
+        assert!(
+            !result.contains("ok"),
+            "a crashed run must never be reported as ok, got: {}",
+            result
+        );
+        assert!(
+            result.contains("Class \"Foo\" not found"),
+            "the fatal error text must survive, got: {}",
+            result
+        );
+        assert!(
+            result.contains("BarTest.php:12"),
+            "the file:line must survive, got: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_phpunit_unrecognized_output_keeps_tail() {
+        let noise = (1..=40)
+            .map(|i| format!("unrecognized line {}", i))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let result = filter_phpunit_output(&noise);
+        assert!(!result.contains("PHPUnit: ok"), "got: {}", result);
+        assert!(result.contains("unrecognized line 40"), "got: {}", result);
+        assert_eq!(
+            result.lines().count(),
+            MAX_FALLBACK_LINES,
+            "tail must be bounded to {} lines",
+            MAX_FALLBACK_LINES
+        );
+    }
+
+    #[test]
+    fn test_phpunit_success_still_compact_with_stderr_noise() {
+        // stderr is now filtered alongside stdout; deprecation noise must not
+        // stop the "OK (...)" anchor from producing a compact summary.
+        let mixed = "PHP Deprecated: Some deprecation in /app/vendor/x.php on line 3\n\
+                     PHPUnit 10.5.0 by Sebastian Bergmann and contributors.\n\n\
+                     .....                                          5 / 5 (100%)\n\n\
+                     Time: 00:00.042, Memory: 8.00 MB\n\n\
+                     OK (5 tests, 12 assertions)\n";
+        let result = filter_phpunit_output(mixed);
+        assert_eq!(result, "PHPUnit: OK (5 tests, 12 assertions)");
     }
 
     #[test]
