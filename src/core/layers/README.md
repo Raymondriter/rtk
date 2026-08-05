@@ -24,7 +24,7 @@ Reserved for Part 2: `dedup`, `unicode`, `ipynb-strip`, `tree-sitter`.
 | Format | Chain | Notes |
 |--------|-------|-------|
 | `json` | `[toon]` | Shape-gated: uniform array of flat objects → TOON; else minified JSON; parse failure → passthrough |
-| `web` | `[ansi, web-md, truncate]` | `web-md` skipped when content is already markdown-ish (tag-density sniff on first 1 KB) |
+| `web` | `[ansi, web-md, toon, truncate]` | `web-md` skipped when content is already markdown-ish (tag-density sniff on first 1 KB); `toon` fires only when the body parses as JSON (raw API responses) |
 | `matches` | `[ansi, grep-group, truncate]` | `grep-group` passes through unchanged when any line is not `path:line:content` (context lines stay faithful) |
 
 ## Reuse map

@@ -77,7 +77,9 @@ pub static TRUNCATE: truncate::TruncateLayer = truncate::TruncateLayer;
 pub static GREP_GROUP: grep_group::GrepGroupLayer = grep_group::GrepGroupLayer;
 
 static JSON_CHAIN: [&dyn Layer; 1] = [&TOON];
-static WEB_CHAIN: [&dyn Layer; 3] = [&ANSI, &WEB_MD, &TRUNCATE];
+// `toon` after `web-md`: fires only when the response body parses as JSON
+// (raw JSON API responses); markdown/HTML passes through it untouched.
+static WEB_CHAIN: [&dyn Layer; 4] = [&ANSI, &WEB_MD, &TOON, &TRUNCATE];
 static MATCHES_CHAIN: [&dyn Layer; 3] = [&ANSI, &GREP_GROUP, &TRUNCATE];
 
 /// Hardcoded Part 1 chain per content format (RTK-owned; users get on/off
@@ -100,7 +102,7 @@ mod tests {
             .iter()
             .map(|l| l.name())
             .collect();
-        assert_eq!(names, vec!["ansi", "web-md", "truncate"]);
+        assert_eq!(names, vec!["ansi", "web-md", "toon", "truncate"]);
 
         let names: Vec<&str> = chain_for(ContentFormat::Matches)
             .iter()
@@ -113,6 +115,38 @@ mod tests {
             .map(|l| l.name())
             .collect();
         assert_eq!(names, vec!["toon"]);
+    }
+
+    #[test]
+    fn test_web_chain_toon_encodes_raw_json_response() {
+        // A WebFetch/WebSearch body that is raw JSON (API endpoint): web-md
+        // skips it (not HTML), toon picks it up.
+        let ctx = LayerCtx {
+            format: ContentFormat::Web,
+            lang: Language::Unknown,
+            source: "https://api.example.com/users",
+        };
+        let input = r#"[
+  {"id": 1, "name": "a"},
+  {"id": 2, "name": "b"},
+  {"id": 3, "name": "c"}
+]"#;
+        let out = run_chain(chain_for(ContentFormat::Web), input, &ctx);
+        assert!(
+            out.starts_with("[3]{id,name}:"),
+            "raw JSON over web must TOON-encode, got: {out}"
+        );
+    }
+
+    #[test]
+    fn test_web_chain_markdown_untouched_by_toon() {
+        let ctx = LayerCtx {
+            format: ContentFormat::Web,
+            lang: Language::Unknown,
+            source: "https://example.com",
+        };
+        let input = "# Title\n\nSome *markdown* text.\n";
+        assert_eq!(run_chain(chain_for(ContentFormat::Web), input, &ctx), input);
     }
 
     #[test]
