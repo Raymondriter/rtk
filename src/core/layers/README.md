@@ -15,20 +15,24 @@ hook (`src/hooks/posthook.rs`). This module sees only content + a
 
 ## Layer names (frozen public vocabulary)
 
-`ansi`, `toon`, `minify-json`, `web-md`, `truncate`, `grep-group`.
+`ansi`, `toon`, `minify-json`, `web-md`, `truncate`, `grep-group`,
+`base64-elide`, `lockfile`, `md-slim`.
 Used in tracking rows and future config values — never rename.
 Reserved for Part 2: `dedup`, `unicode`, `ipynb-strip`, `tree-sitter`.
 
 ## Part 1 chains (hardcoded, RTK-owned, conversion-only)
 
 Chains reformat content, they never drop it — no truncation on the posthook
-path. `truncate` exists as a reserved layer only.
+path. `truncate` exists as a reserved layer only. (`base64-elide` replaces
+value-free blobs with a size marker; `lockfile`/`md-slim` drop only
+read-noise — hashes, badges, comments.)
 
 | Format | Chain | Notes |
 |--------|-------|-------|
-| `json` | `[toon]` | Shape-gated: uniform array of flat objects → TOON; else minified JSON; parse failure → passthrough |
-| `web` | `[ansi, web-md, toon]` | `web-md` skipped when content is already markdown-ish (tag-density sniff on first 1 KB); `toon` fires only when the body parses as JSON (raw API responses) |
-| `matches` | `[grep-group]` | Lossless grouping (all matches emitted); passes through unchanged when any line is not `path:line:content` (context lines stay faithful). No `ansi`: an ESC byte in a match is genuine file content |
+| `json` | `[base64-elide, toon]` | Long base64 runs → `[base64 <mime>, N KB elided]`; then shape-gated: uniform array of flat objects → TOON; else minified JSON; parse failure → passthrough |
+| `web` | `[ansi, base64-elide, web-md, toon, md-slim]` | `web-md` skipped when content is already markdown-ish (tag-density sniff on first 1 KB); `toon` fires only when the body parses as JSON and short-circuits, so `md-slim` (badges/comments/blank runs; link URLs KEPT) only sees markdown |
+| `matches` | `[grep-group]` | Lossless grouping (all matches emitted); passes through unchanged when any line is not `path:line:content` (context lines stay faithful). No `ansi`/`base64-elide`: bytes in a match are genuine file content |
+| `lockfile` | `[lockfile]` | package-lock.json / Cargo.lock / yarn.lock / pnpm-lock.yaml → `name@version` list + count. Content-sniffed type; unknown → passthrough. Read-for-consumption class: no Edit-anchor risk |
 
 ## Reuse map
 

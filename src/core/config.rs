@@ -200,6 +200,7 @@ impl Default for PosthookTools {
 pub struct PosthookFormats {
     pub json: String,
     pub web: String,
+    pub lockfile: String,
 }
 
 impl Default for PosthookFormats {
@@ -207,6 +208,7 @@ impl Default for PosthookFormats {
         Self {
             json: "auto".into(),
             web: "auto".into(),
+            lockfile: "auto".into(),
         }
     }
 }
@@ -370,6 +372,7 @@ history_days = 90
         assert!(config.posthook.exclude_paths.is_empty());
         assert_eq!(config.posthook.formats.json, "auto");
         assert_eq!(config.posthook.formats.web, "auto");
+        assert_eq!(config.posthook.formats.lockfile, "auto");
     }
 
     #[test]

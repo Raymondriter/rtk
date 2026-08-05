@@ -58,6 +58,7 @@ tools = { read = true, grep = true, webfetch = true, websearch = true, glob = fa
 [posthook.formats]          # per-format converter: "auto" | "off"
 json = "auto"
 web = "auto"
+lockfile = "auto"
 ```
 
 For full details on what is collected, opt-out options, and GDPR rights, see [Telemetry & Privacy](../resources/telemetry.md).
@@ -106,7 +107,14 @@ model reads when (and only when) the filtered version is smaller:
 - **Grep (content mode)** — matches are grouped by file (`grep-group`),
   losslessly: every match is kept.
 - **WebFetch / WebSearch** — ANSI stripping, HTML→Markdown when the response
-  is raw HTML, TOON/minify when the response body is raw JSON.
+  is raw HTML, TOON/minify when the response body is raw JSON, badge/comment
+  slimming on markdown (link URLs kept).
+- **Lockfiles** (package-lock.json, Cargo.lock, yarn.lock, pnpm-lock.yaml) —
+  summarized to a `name@version` list + count (90%+ smaller; nobody edits a
+  lockfile by hand, tooling regenerates it).
+- **Base64 blobs** (embedded images, data URLs, fonts) — runs over ~1KB
+  replaced with `[base64 image/png, 48 KB elided]` markers in JSON and web
+  content; grep matches stay byte-faithful.
 
 All chains are conversion-only: content is reformatted, never truncated.
 

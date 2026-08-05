@@ -6,12 +6,15 @@
 //! the caller's job, keeping this module panic-policy-free.
 //!
 //! Layer names (`ansi`, `toon`, `minify-json`, `web-md`, `truncate`,
-//! `grep-group`) are a frozen public vocabulary used in tracking and future
-//! config. Reserved for Part 2: `dedup`, `unicode`, `ipynb-strip`,
-//! `tree-sitter`.
+//! `grep-group`, `base64-elide`, `lockfile`, `md-slim`) are a frozen public
+//! vocabulary used in tracking and future config. Reserved for Part 2:
+//! `dedup`, `unicode`, `ipynb-strip`, `tree-sitter`.
 
 pub mod ansi;
+pub mod base64_elide;
 pub mod grep_group;
+pub mod lockfile;
+pub mod md_slim;
 pub mod minify_json;
 pub mod toon;
 pub mod truncate;
@@ -28,6 +31,8 @@ pub enum ContentFormat {
     Web,
     /// Grep-style match lines (`path:line:content`); internal format.
     Matches,
+    /// Package lockfiles (package-lock.json, Cargo.lock, yarn.lock, pnpm-lock.yaml).
+    Lockfile,
 }
 
 /// Context passed to every layer in a chain. `format`/`source` are part of
@@ -69,24 +74,30 @@ pub fn run_chain(layers: &[&dyn Layer], input: &str, ctx: &LayerCtx) -> String {
 }
 
 pub static ANSI: ansi::AnsiLayer = ansi::AnsiLayer;
+pub static BASE64_ELIDE: base64_elide::Base64ElideLayer = base64_elide::Base64ElideLayer;
 pub static TOON: toon::ToonLayer = toon::ToonLayer;
 #[allow(dead_code)] // frozen layer name; json chain minifies inside `toon`'s shape gate
 pub static MINIFY_JSON: minify_json::MinifyJsonLayer = minify_json::MinifyJsonLayer;
 pub static WEB_MD: web_md::WebMdLayer = web_md::WebMdLayer;
+pub static MD_SLIM: md_slim::MdSlimLayer = md_slim::MdSlimLayer;
 #[allow(dead_code)] // reserved layer: no Part 1 chain truncates (conversion-only)
 pub static TRUNCATE: truncate::TruncateLayer = truncate::TruncateLayer;
 pub static GREP_GROUP: grep_group::GrepGroupLayer = grep_group::GrepGroupLayer;
+pub static LOCKFILE: lockfile::LockfileLayer = lockfile::LockfileLayer;
 
 // Part 1 chains are conversion-only (maintainer decision): no truncation on
 // the posthook path — content is reformatted, never dropped. `truncate`
 // stays available as a reserved layer.
-static JSON_CHAIN: [&dyn Layer; 1] = [&TOON];
+static JSON_CHAIN: [&dyn Layer; 2] = [&BASE64_ELIDE, &TOON];
 // `toon` after `web-md`: fires only when the response body parses as JSON
-// (raw JSON API responses); markdown/HTML passes through it untouched.
-static WEB_CHAIN: [&dyn Layer; 3] = [&ANSI, &WEB_MD, &TOON];
-// No `ansi` here: an ESC byte in a Grep match is genuine file content (the
-// host never colors Grep output) — stripping it would falsify the file.
+// (raw JSON API responses) and short-circuits on conversion, so `md-slim`
+// only ever sees markdown/plain text.
+static WEB_CHAIN: [&dyn Layer; 5] = [&ANSI, &BASE64_ELIDE, &WEB_MD, &TOON, &MD_SLIM];
+// No `ansi`/`base64-elide` here: bytes in a Grep match are genuine file
+// content (the host never colors Grep output) — rewriting them would
+// falsify the file.
 static MATCHES_CHAIN: [&dyn Layer; 1] = [&GREP_GROUP];
+static LOCKFILE_CHAIN: [&dyn Layer; 1] = [&LOCKFILE];
 
 /// Hardcoded Part 1 chain per content format (RTK-owned; users get on/off
 /// per tool + per format + exclude_paths, not chain editing).
@@ -95,6 +106,7 @@ pub fn chain_for(format: ContentFormat) -> &'static [&'static dyn Layer] {
         ContentFormat::Json => &JSON_CHAIN,
         ContentFormat::Web => &WEB_CHAIN,
         ContentFormat::Matches => &MATCHES_CHAIN,
+        ContentFormat::Lockfile => &LOCKFILE_CHAIN,
     }
 }
 
@@ -108,7 +120,10 @@ mod tests {
             .iter()
             .map(|l| l.name())
             .collect();
-        assert_eq!(names, vec!["ansi", "web-md", "toon"]);
+        assert_eq!(
+            names,
+            vec!["ansi", "base64-elide", "web-md", "toon", "md-slim"]
+        );
 
         let names: Vec<&str> = chain_for(ContentFormat::Matches)
             .iter()
@@ -120,7 +135,13 @@ mod tests {
             .iter()
             .map(|l| l.name())
             .collect();
-        assert_eq!(names, vec!["toon"]);
+        assert_eq!(names, vec!["base64-elide", "toon"]);
+
+        let names: Vec<&str> = chain_for(ContentFormat::Lockfile)
+            .iter()
+            .map(|l| l.name())
+            .collect();
+        assert_eq!(names, vec!["lockfile"]);
     }
 
     #[test]

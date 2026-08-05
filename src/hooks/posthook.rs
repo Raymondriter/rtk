@@ -31,9 +31,9 @@ const MIN_POSTHOOK_SIZE: usize = 512;
 /// Read→Edit fidelity guard, emitted as `additionalContext` whenever a Read
 /// output was format-converted (content no longer textually identical to the
 /// on-disk file).
-const READ_CONVERSION_NOTE: &str = "RTK compressed this Read output (json->toon/minify). \
-     The on-disk file is unchanged; re-read with rtk disabled or check the recall file \
-     before constructing Edit old_string values.";
+const READ_CONVERSION_NOTE: &str = "RTK compressed this Read output (format conversion, \
+     e.g. json->toon, lockfile summary). The on-disk file is unchanged; re-read with rtk \
+     disabled or check the recall file before constructing Edit old_string values.";
 
 /// Entry point: never panics, never errors, emits at most one stdout line.
 pub fn run(event: &Value) {
@@ -327,7 +327,11 @@ fn extract(
     match tool_name {
         "Read" => {
             let content = event.pointer("/tool_response/file/content")?.as_str()?;
-            let format = if extension_of(source) == "json" {
+            // Lockfile check first: package-lock.json would otherwise
+            // classify as plain json by extension.
+            let format = if is_lockfile_name(&basename_of(source)) {
+                Some(ContentFormat::Lockfile)
+            } else if extension_of(source) == "json" {
                 Some(ContentFormat::Json)
             } else {
                 None
@@ -375,6 +379,7 @@ fn format_setting(config: &PosthookConfig, format: ContentFormat) -> FormatSetti
     let value = match format {
         ContentFormat::Json => config.formats.json.as_str(),
         ContentFormat::Web => config.formats.web.as_str(),
+        ContentFormat::Lockfile => config.formats.lockfile.as_str(),
         ContentFormat::Matches => return FormatSetting::Auto,
     };
     match value {
@@ -395,7 +400,17 @@ fn format_token(format: ContentFormat) -> &'static str {
         ContentFormat::Json => "json",
         ContentFormat::Web => "web",
         ContentFormat::Matches => "matches",
+        ContentFormat::Lockfile => "lockfile",
     }
+}
+
+/// Lockfile basenames served by the `lockfile` format (type is then
+/// content-sniffed inside the layer).
+fn is_lockfile_name(basename: &str) -> bool {
+    matches!(
+        basename,
+        "package-lock.json" | "Cargo.lock" | "yarn.lock" | "pnpm-lock.yaml"
+    )
 }
 
 /// Re-wrap the filtered text in the same output shape the tool produced.
@@ -685,6 +700,35 @@ mod tests {
             }}
         });
         assert!(process_with_config(&event, &test_config()).is_none());
+    }
+
+    #[test]
+    fn test_read_cargo_lock_summarized_with_note() {
+        let content = include_str!("../../Cargo.lock");
+        let event = serde_json::json!({
+            "tool_name": "Read",
+            "tool_input": {"file_path": "/repo/Cargo.lock"},
+            "tool_response": {"type": "text", "file": {
+                "filePath": "/repo/Cargo.lock",
+                "content": content,
+                "numLines": content.lines().count(),
+                "startLine": 1,
+                "totalLines": content.lines().count()
+            }},
+            "duration_ms": 3
+        });
+        let out = process_with_config(&event, &test_config()).expect("lockfile must summarize");
+        let v: Value = serde_json::from_str(&out).expect("valid JSON");
+        let hook = &v["hookSpecificOutput"];
+        let new_content = hook["updatedToolOutput"]["file"]["content"]
+            .as_str()
+            .unwrap();
+        assert!(new_content.starts_with("Cargo.lock: "), "summary header");
+        assert!(new_content.contains("serde@"));
+        assert!(
+            hook["additionalContext"].as_str().is_some(),
+            "Read conversion note"
+        );
     }
 
     #[test]
