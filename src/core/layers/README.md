@@ -28,7 +28,7 @@ path. `truncate` exists as a reserved layer only.
 |--------|-------|-------|
 | `json` | `[toon]` | Shape-gated: uniform array of flat objects → TOON; else minified JSON; parse failure → passthrough |
 | `web` | `[ansi, web-md, toon]` | `web-md` skipped when content is already markdown-ish (tag-density sniff on first 1 KB); `toon` fires only when the body parses as JSON (raw API responses) |
-| `matches` | `[ansi, grep-group]` | Lossless grouping (all matches emitted); passes through unchanged when any line is not `path:line:content` (context lines stay faithful) |
+| `matches` | `[grep-group]` | Lossless grouping (all matches emitted); passes through unchanged when any line is not `path:line:content` (context lines stay faithful). No `ansi`: an ESC byte in a match is genuine file content |
 
 ## Reuse map
 

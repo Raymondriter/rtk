@@ -84,7 +84,9 @@ static JSON_CHAIN: [&dyn Layer; 1] = [&TOON];
 // `toon` after `web-md`: fires only when the response body parses as JSON
 // (raw JSON API responses); markdown/HTML passes through it untouched.
 static WEB_CHAIN: [&dyn Layer; 3] = [&ANSI, &WEB_MD, &TOON];
-static MATCHES_CHAIN: [&dyn Layer; 2] = [&ANSI, &GREP_GROUP];
+// No `ansi` here: an ESC byte in a Grep match is genuine file content (the
+// host never colors Grep output) — stripping it would falsify the file.
+static MATCHES_CHAIN: [&dyn Layer; 1] = [&GREP_GROUP];
 
 /// Hardcoded Part 1 chain per content format (RTK-owned; users get on/off
 /// per tool + per format + exclude_paths, not chain editing).
@@ -112,7 +114,7 @@ mod tests {
             .iter()
             .map(|l| l.name())
             .collect();
-        assert_eq!(names, vec!["ansi", "grep-group"]);
+        assert_eq!(names, vec!["grep-group"]);
 
         let names: Vec<&str> = chain_for(ContentFormat::Json)
             .iter()
