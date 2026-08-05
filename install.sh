@@ -163,8 +163,48 @@ verify() {
     fi
 }
 
+# ── Version-gated release notes ─────────────────────────────
+# Post-install notices shown only when upgrading across a specific
+# version. Add a block in show_release_notes when a release needs a
+# one-time migration notice; prune entries once obsolete.
+
+# Numeric semver compare: returns 0 when $1 < $2.
+# Strips a leading "v" and any pre-release/build suffix
+# ("v0.45.0" and "0.42.7-pro" compare as 0.45.0 and 0.42.7).
+version_lt() {
+    _a=$(printf '%s' "$1" | sed -E 's/^v//; s/[-+].*$//')
+    _b=$(printf '%s' "$2" | sed -E 's/^v//; s/[-+].*$//')
+    if [ "$_a" = "$_b" ]; then
+        return 1
+    fi
+    [ "$(printf '%s\n%s\n' "$_a" "$_b" | sort -t. -k1,1n -k2,2n -k3,3n | head -n1)" = "$_a" ]
+}
+
+show_release_notes() {
+    # Fresh install: configs are written correctly from the start.
+    if [ -z "$OLD_VERSION" ]; then
+        return 0
+    fi
+
+    # Copilot hook registration changed to a single PascalCase entry.
+    # NOTE: keep this threshold in sync with the release tag that ships it.
+    if version_lt "$OLD_VERSION" "0.45.0" && ! version_lt "$VERSION" "0.45.0"; then
+        echo ""
+        warn "This upgrade changes the GitHub Copilot hook registration."
+        warn "Run 'rtk init --copilot' in each project using the Copilot"
+        warn "integration to drop the legacy duplicate hook (see release notes)."
+    fi
+}
+
 main() {
     info "Installing $BINARY_NAME..."
+
+    # Capture the pre-upgrade version (empty on fresh installs) before the
+    # binary is replaced, so show_release_notes can tell upgrade from install.
+    OLD_VERSION=""
+    if command -v "$BINARY_NAME" >/dev/null 2>&1; then
+        OLD_VERSION=$("$BINARY_NAME" --version 2>/dev/null | awk '{print $2}') || OLD_VERSION=""
+    fi
 
     detect_os
     detect_arch
@@ -177,6 +217,7 @@ main() {
     fi
     install
     verify
+    show_release_notes
 
     echo ""
     info "Installation complete! Run '$BINARY_NAME --help' to get started."
