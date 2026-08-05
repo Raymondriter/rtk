@@ -71,6 +71,15 @@ This data directly drives our roadmap. For example, if telemetry shows that 40% 
 |-------|---------|---------|
 | `ecosystem_mix` | `{"git": 45, "cargo": 20, "js": 15}` | Category percentages — where to invest filter development |
 
+PostToolUse output filtering (Claude Code native tools) appears in these
+aggregates under fixed low-cardinality identifiers: tracking rows use
+`rtk_cmd = "rtk posthook <tool> <format>"` (e.g. `rtk posthook read json`,
+`rtk posthook grep matches`, `rtk posthook webfetch web`), so `top_commands`
+reports `posthook` and `ecosystem_mix` gains a `posthook` category. The
+`original_cmd` column stores `<ToolName> <path|url>` and is aggregated the
+same way as Bash rows (first word only in `passthrough_top`); paths and URLs
+themselves are never sent.
+
 ### Retention (engagement)
 
 | Field | Example | Purpose |

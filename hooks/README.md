@@ -29,6 +29,8 @@ Agent runs command (e.g., "cargo test --nocapture")
 
 All rewrite logic lives in the Rust binary (`src/discover/registry.rs`). Hook scripts are **thin delegates** that handle agent-specific JSON formats and call `rtk rewrite` for the actual decision. This ensures a single source of truth for all 70+ rewrite patterns.
 
+On Claude Code, a second event covers the agent's **native tools** (Read, Grep, WebFetch, WebSearch), which never reach Bash: a `PostToolUse` hook on the same `rtk hook claude` command compresses the tool output after it runs (`updatedToolOutput`), with the raw output preserved in a recall file. See [`claude/README.md`](claude/README.md) and `src/hooks/posthook.rs`.
+
 ## Directory Structure
 
 Each agent subdirectory has its own README with hook-specific details:

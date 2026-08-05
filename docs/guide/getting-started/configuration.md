@@ -49,6 +49,15 @@ enabled = true              # anonymous daily ping — see Telemetry & Privacy f
 
 [hooks]
 exclude_commands = []       # commands to never auto-rewrite
+
+[posthook]
+enabled = true              # PostToolUse output filtering (Claude Code)
+exclude_paths = []          # globs vs file_path/url, e.g. ["**/*.min.js"]
+tools = { read = true, grep = true, webfetch = true, websearch = true, glob = false }
+
+[posthook.formats]          # per-format converter: "auto" | "off"
+json = "auto"
+web = "auto"
 ```
 
 For full details on what is collected, opt-out options, and GDPR rights, see [Telemetry & Privacy](../resources/telemetry.md).
@@ -57,7 +66,9 @@ For full details on what is collected, opt-out options, and GDPR rights, see [Te
 
 | Variable | Description |
 |----------|-------------|
-| `RTK_DISABLED=1` | Disable RTK for a single command (`RTK_DISABLED=1 git status`) |
+| `RTK_DISABLED=1` | Disable RTK for a single command (`RTK_DISABLED=1 git status`); also kills all posthook filtering (`RTK_DISABLED=1 claude`) |
+| `RTK_POSTHOOK=0` | Disable PostToolUse output filtering only |
+| `RTK_TEE=0` | Disable tee raw-output recovery (including posthook recall files) |
 | `RTK_TEE_DIR` | Override the tee directory |
 | `RTK_TELEMETRY_DISABLED=1` | Disable telemetry |
 | `RTK_HOOK_AUDIT=1` | Enable hook audit logging |
@@ -81,6 +92,32 @@ Your AI assistant can then read the file if it needs more detail, without re-run
 | `tee.max_files` | `20` | Rotation: keep last N files |
 | Min size | 500 bytes | Outputs shorter than this are not saved |
 | Max file size | 1 MB | Truncated above this |
+
+## PostToolUse output filtering (posthook)
+
+On Claude Code, RTK also compresses the output of the agent's native tools —
+Read, Grep, WebFetch, WebSearch (Glob wired but off by default). The tool runs
+raw; a PostToolUse hook sends the result through RTK, which replaces what the
+model reads when (and only when) the filtered version is smaller:
+
+- **Read of `.json` files** — uniform arrays of flat objects are re-encoded as
+  [TOON](https://github.com/johannschopplich/toon); other JSON is minified.
+  A note is attached telling the agent the on-disk file is unchanged.
+- **Grep (content mode)** — matches are grouped by file (`grep-group`).
+- **WebFetch / WebSearch** — ANSI stripping, HTML→Markdown when the response
+  is raw HTML, truncation.
+
+Before filtering, the raw output is saved to
+`~/.local/share/rtk/tee/posthook/` (20-file rotation) and a
+`[full output: …]` hint is appended, so the agent can always recover the
+original via `cat`/`tail`.
+
+Failed tool calls, `@`-referenced files, and Reads over the host's 256KB limit
+never reach the hook and pass through unfiltered.
+
+Toggles: `[posthook]` config section (per tool, per format, `exclude_paths`
+globs), `RTK_POSTHOOK=0`, or `RTK_DISABLED=1` for everything. Savings appear
+in `rtk gain` as `rtk posthook <tool> <format>` rows.
 
 ## Excluding commands from auto-rewrite
 
