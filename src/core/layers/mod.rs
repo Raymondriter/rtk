@@ -12,10 +12,13 @@
 
 pub mod ansi;
 pub mod base64_elide;
+pub mod cap;
+pub mod dedup;
 pub mod grep_group;
 pub mod lockfile;
 pub mod md_slim;
 pub mod minify_json;
+pub mod progress;
 pub mod toon;
 pub mod truncate;
 pub mod web_md;
@@ -33,6 +36,8 @@ pub enum ContentFormat {
     Matches,
     /// Package lockfiles (package-lock.json, Cargo.lock, yarn.lock, pnpm-lock.yaml).
     Lockfile,
+    /// Raw terminal output (Bash tool, commands not rewritten by RTK).
+    Term,
 }
 
 /// Context passed to every layer in a chain. `format`/`source` are part of
@@ -84,6 +89,9 @@ pub static MD_SLIM: md_slim::MdSlimLayer = md_slim::MdSlimLayer;
 pub static TRUNCATE: truncate::TruncateLayer = truncate::TruncateLayer;
 pub static GREP_GROUP: grep_group::GrepGroupLayer = grep_group::GrepGroupLayer;
 pub static LOCKFILE: lockfile::LockfileLayer = lockfile::LockfileLayer;
+pub static PROGRESS: progress::ProgressLayer = progress::ProgressLayer;
+pub static DEDUP: dedup::DedupLayer = dedup::DedupLayer;
+pub static CAP: cap::CapLayer = cap::CapLayer;
 
 // Part 1 chains are conversion-only (maintainer decision): no truncation on
 // the posthook path — content is reformatted, never dropped. `truncate`
@@ -98,6 +106,11 @@ static WEB_CHAIN: [&dyn Layer; 5] = [&ANSI, &BASE64_ELIDE, &WEB_MD, &TOON, &MD_S
 // falsify the file.
 static MATCHES_CHAIN: [&dyn Layer; 1] = [&GREP_GROUP];
 static LOCKFILE_CHAIN: [&dyn Layer; 1] = [&LOCKFILE];
+// Bash generic floor: objective byte-level transforms only, each lossless or
+// explicitly marked and recoverable via the recall file. `cap` is tail-biased
+// (bash errors live at the end) — the one deliberately lossy step, requested
+// for runaway outputs.
+static TERM_CHAIN: [&dyn Layer; 5] = [&ANSI, &PROGRESS, &DEDUP, &BASE64_ELIDE, &CAP];
 
 /// Hardcoded Part 1 chain per content format (RTK-owned; users get on/off
 /// per tool + per format + exclude_paths, not chain editing).
@@ -107,6 +120,7 @@ pub fn chain_for(format: ContentFormat) -> &'static [&'static dyn Layer] {
         ContentFormat::Web => &WEB_CHAIN,
         ContentFormat::Matches => &MATCHES_CHAIN,
         ContentFormat::Lockfile => &LOCKFILE_CHAIN,
+        ContentFormat::Term => &TERM_CHAIN,
     }
 }
 
@@ -142,6 +156,15 @@ mod tests {
             .map(|l| l.name())
             .collect();
         assert_eq!(names, vec!["lockfile"]);
+
+        let names: Vec<&str> = chain_for(ContentFormat::Term)
+            .iter()
+            .map(|l| l.name())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["ansi", "progress", "dedup", "base64-elide", "cap"]
+        );
     }
 
     #[test]

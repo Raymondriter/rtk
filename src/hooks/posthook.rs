@@ -22,8 +22,10 @@ use crate::core::layers::{self, ContentFormat, LayerCtx};
 use crate::core::tee;
 use crate::core::tracking::{estimate_tokens, Tracker};
 use crate::core::utils::glob_match;
+use regex::Regex;
 use serde_json::{json, Value};
 use std::io::{self, Write};
+use std::sync::LazyLock;
 
 /// Raw content below this is not worth the write/track overhead.
 const MIN_POSTHOOK_SIZE: usize = 512;
@@ -85,6 +87,9 @@ fn process_with_config(event: &Value, config: &Config) -> Option<String> {
 
     if tool_name == "WebSearch" {
         return process_websearch(event, config, &source, duration_ms);
+    }
+    if tool_name == "Bash" {
+        return process_bash(event, config, duration_ms);
     }
 
     let (raw, format) = extract(event, tool_name, &source)?;
@@ -298,8 +303,140 @@ fn tool_enabled(config: &PosthookConfig, tool_name: &str) -> bool {
         "Glob" => config.tools.glob,
         "WebFetch" => config.tools.webfetch,
         "WebSearch" => config.tools.websearch,
+        "Bash" => config.tools.bash,
         _ => false,
     }
+}
+
+/// `rtk` invoked anywhere in the command (start or after a shell operator):
+/// output already went through RTK's own filters — never double-process.
+/// False positives (e.g. `echo rtk hook`) just skip filtering, safe direction.
+static RTK_IN_COMMAND: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?:^|[|&;(\s])rtk\s").expect("valid regex"));
+
+/// Generic floor for Bash commands not rewritten by RTK: objective
+/// byte-level transforms only (ansi, progress, dedup, base64-elide, cap).
+fn process_bash(event: &Value, config: &Config, duration_ms: u64) -> Option<String> {
+    let response = event.get("tool_response")?;
+    if response
+        .get("interrupted")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+        || response
+            .get("isImage")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    {
+        return None;
+    }
+
+    let command = event
+        .pointer("/tool_input/command")
+        .and_then(|c| c.as_str())
+        .unwrap_or("");
+    if RTK_IN_COMMAND.is_match(command) {
+        return None;
+    }
+    // Recall-recovery gate: a command reading the recall store must see the
+    // raw bytes (else e.g. an elided base64 blob could never be recovered).
+    if command.contains("tee/posthook")
+        || tee::posthook_recall_dir(config)
+            .is_some_and(|d| command.contains(&d.display().to_string()))
+    {
+        return None;
+    }
+
+    match format_setting(&config.posthook, ContentFormat::Term) {
+        FormatSetting::Off => return None,
+        FormatSetting::Auto => {}
+    }
+
+    let stdout = response
+        .get("stdout")
+        .and_then(|s| s.as_str())
+        .unwrap_or("");
+    let stderr = response
+        .get("stderr")
+        .and_then(|s| s.as_str())
+        .unwrap_or("");
+    if stdout.len() + stderr.len() < MIN_POSTHOOK_SIZE {
+        return None;
+    }
+
+    let first_word = command.split_whitespace().next().unwrap_or("");
+    let ctx = LayerCtx {
+        format: ContentFormat::Term,
+        lang: Language::Unknown,
+        source: command,
+    };
+    let chain = layers::chain_for(ContentFormat::Term);
+    let filtered_stdout = layers::run_chain(chain, stdout, &ctx);
+    let filtered_stderr = if stderr.is_empty() {
+        String::new()
+    } else {
+        layers::run_chain(chain, stderr, &ctx)
+    };
+
+    let raw_combined = if stderr.is_empty() {
+        stdout.to_string()
+    } else {
+        format!("{stdout}\n--- stderr ---\n{stderr}")
+    };
+
+    if filtered_stdout == stdout && filtered_stderr == stderr {
+        track(
+            "Bash",
+            "term",
+            first_word,
+            &raw_combined,
+            &raw_combined,
+            duration_ms,
+        );
+        return None;
+    }
+
+    let slug = format!("bash_{first_word}");
+    let hint = tee::posthook_tee_hint(config, &raw_combined, &slug);
+    let composed_stdout = match hint {
+        Some(h) => format!("{filtered_stdout}\n{h}"),
+        None => filtered_stdout,
+    };
+
+    let emitted_combined = format!("{composed_stdout}{filtered_stderr}");
+    if estimate_tokens(&emitted_combined) > estimate_tokens(&raw_combined) {
+        track(
+            "Bash",
+            "term",
+            first_word,
+            &raw_combined,
+            &raw_combined,
+            duration_ms,
+        );
+        return None;
+    }
+
+    let mut updated = response.clone();
+    let obj = updated.as_object_mut()?;
+    obj.insert("stdout".into(), json!(composed_stdout));
+    obj.insert("stderr".into(), json!(filtered_stderr));
+
+    track(
+        "Bash",
+        "term",
+        first_word,
+        &raw_combined,
+        &emitted_combined,
+        duration_ms,
+    );
+    Some(
+        json!({
+            "hookSpecificOutput": {
+                "hookEventName": POST_TOOL_USE_KEY,
+                "updatedToolOutput": updated,
+            }
+        })
+        .to_string(),
+    )
 }
 
 /// Path or URL the exclude globs and tracking rows key on.
@@ -380,6 +517,7 @@ fn format_setting(config: &PosthookConfig, format: ContentFormat) -> FormatSetti
         ContentFormat::Json => config.formats.json.as_str(),
         ContentFormat::Web => config.formats.web.as_str(),
         ContentFormat::Lockfile => config.formats.lockfile.as_str(),
+        ContentFormat::Term => config.formats.term.as_str(),
         ContentFormat::Matches => return FormatSetting::Auto,
     };
     match value {
@@ -401,6 +539,7 @@ fn format_token(format: ContentFormat) -> &'static str {
         ContentFormat::Web => "web",
         ContentFormat::Matches => "matches",
         ContentFormat::Lockfile => "lockfile",
+        ContentFormat::Term => "term",
     }
 }
 
@@ -763,6 +902,103 @@ mod tests {
             hook["additionalContext"].as_str().is_some(),
             "Read conversion note"
         );
+    }
+
+    fn bash_fixture(name: &str) -> Value {
+        let raw = match name {
+            "ansi" => include_str!("../../tests/fixtures/posthook/bash_ansi_output.json"),
+            "progress" => include_str!("../../tests/fixtures/posthook/bash_progress_cr.json"),
+            "repetitive" => {
+                include_str!("../../tests/fixtures/posthook/bash_repetitive_lines.json")
+            }
+            _ => panic!("unknown fixture {name}"),
+        };
+        serde_json::from_str(raw).expect("fixture parses")
+    }
+
+    #[test]
+    fn test_bash_ansi_output_stripped_and_rewrapped() {
+        let out = process_with_config(&bash_fixture("ansi"), &test_config())
+            .expect("ansi output must be filtered");
+        let v: Value = serde_json::from_str(&out).expect("valid JSON");
+        let response = &v["hookSpecificOutput"]["updatedToolOutput"];
+        let stdout = response["stdout"].as_str().unwrap();
+        assert!(!stdout.contains('\x1b'), "ANSI gone");
+        assert!(stdout.contains("PASS test_0"), "content kept");
+        assert_eq!(response["interrupted"], false, "metadata preserved");
+        assert_eq!(response["isImage"], false);
+        assert!(
+            v["hookSpecificOutput"].get("additionalContext").is_none(),
+            "no conversion note for the generic floor"
+        );
+    }
+
+    #[test]
+    fn test_bash_progress_frames_collapsed() {
+        let out = process_with_config(&bash_fixture("progress"), &test_config())
+            .expect("progress output must be filtered");
+        let v: Value = serde_json::from_str(&out).expect("valid JSON");
+        let stdout = v["hookSpecificOutput"]["updatedToolOutput"]["stdout"]
+            .as_str()
+            .unwrap();
+        assert!(stdout.contains("Downloading 100% done"));
+        assert!(!stdout.contains("Downloading 0%"));
+    }
+
+    #[test]
+    fn test_bash_repetitive_lines_deduped() {
+        let out = process_with_config(&bash_fixture("repetitive"), &test_config())
+            .expect("repetitive output must be filtered");
+        let v: Value = serde_json::from_str(&out).expect("valid JSON");
+        let stdout = v["hookSpecificOutput"]["updatedToolOutput"]["stdout"]
+            .as_str()
+            .unwrap();
+        assert!(stdout.contains("[x40]"), "explicit dedup marker: {stdout}");
+    }
+
+    #[test]
+    fn test_bash_rtk_rewritten_command_skipped() {
+        let mut event = bash_fixture("repetitive");
+        event["tool_input"]["command"] = json!("rtk cargo test");
+        assert!(process_with_config(&event, &test_config()).is_none());
+
+        event["tool_input"]["command"] = json!("git add . && rtk cargo test");
+        assert!(process_with_config(&event, &test_config()).is_none());
+    }
+
+    #[test]
+    fn test_bash_recall_recovery_command_skipped() {
+        let mut event = bash_fixture("repetitive");
+        event["tool_input"]["command"] =
+            json!("cat \"$HOME/.local/share/rtk/tee/posthook/123_1-0_bash_x.log\"");
+        assert!(process_with_config(&event, &test_config()).is_none());
+    }
+
+    #[test]
+    fn test_bash_interrupted_skipped() {
+        let mut event = bash_fixture("repetitive");
+        event["tool_response"]["interrupted"] = json!(true);
+        assert!(process_with_config(&event, &test_config()).is_none());
+    }
+
+    #[test]
+    fn test_bash_tool_toggle_off() {
+        let mut config = test_config();
+        config.posthook.tools.bash = false;
+        assert!(process_with_config(&bash_fixture("repetitive"), &config).is_none());
+    }
+
+    #[test]
+    fn test_bash_stderr_filtered_independently() {
+        let mut event = bash_fixture("ansi");
+        event["tool_response"]["stderr"] = json!("\x1b[31merror line\x1b[0m\n".repeat(10));
+        let out = process_with_config(&event, &test_config()).expect("stderr must be filtered too");
+        let v: Value = serde_json::from_str(&out).expect("valid JSON");
+        let stderr = v["hookSpecificOutput"]["updatedToolOutput"]["stderr"]
+            .as_str()
+            .unwrap();
+        assert!(!stderr.contains('\x1b'));
+        assert!(stderr.contains("[x10]"));
     }
 
     #[test]

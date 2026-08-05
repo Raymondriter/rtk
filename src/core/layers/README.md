@@ -16,9 +16,9 @@ hook (`src/hooks/posthook.rs`). This module sees only content + a
 ## Layer names (frozen public vocabulary)
 
 `ansi`, `toon`, `minify-json`, `web-md`, `truncate`, `grep-group`,
-`base64-elide`, `lockfile`, `md-slim`.
+`base64-elide`, `lockfile`, `md-slim`, `progress`, `dedup`, `cap`.
 Used in tracking rows and future config values — never rename.
-Reserved for Part 2: `dedup`, `unicode`, `ipynb-strip`, `tree-sitter`.
+Reserved for Part 2: `unicode`, `ipynb-strip`, `tree-sitter`.
 
 ## Part 1 chains (hardcoded, RTK-owned, conversion-only)
 
@@ -33,6 +33,7 @@ read-noise — hashes, badges, comments.)
 | `web` | `[ansi, base64-elide, web-md, toon, md-slim]` | `web-md` skipped when content is already markdown-ish (tag-density sniff on first 1 KB); `toon` fires only when the body parses as JSON and short-circuits, so `md-slim` (badges/comments/blank runs; link URLs KEPT) only sees markdown |
 | `matches` | `[grep-group]` | Lossless grouping (all matches emitted); passes through unchanged when any line is not `path:line:content` (context lines stay faithful). No `ansi`/`base64-elide`: bytes in a match are genuine file content |
 | `lockfile` | `[lockfile]` | package-lock.json / Cargo.lock / yarn.lock / pnpm-lock.yaml → `name@version` list + count. Content-sniffed type; unknown → passthrough. Read-for-consumption class: no Edit-anchor risk |
+| `term` | `[ansi, progress, dedup, base64-elide, cap]` | Generic floor for Bash commands NOT rtk-rewritten. Objective byte-level triggers only: ESC → strip, `\r` frames → last visible frame, ≥3 identical adjacent non-blank lines → `[xN]`, base64 runs → size marker, >300 lines → head 50 + tail 200 + `[N lines elided]` (tail-biased: bash errors live at the end). `cap` is the one deliberately lossy step; full copy always in recall |
 
 ## Reuse map
 

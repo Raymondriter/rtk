@@ -1006,7 +1006,8 @@ fn patch_settings_json_command(
         serde_json::json!({})
     };
 
-    // Check idempotency per event (a pre-only install still needs the post hook)
+    // Check idempotency per event (a pre-only install still needs the post
+    // hook); a stale PostToolUse matcher also needs a patch.
     let events = [
         (PRE_TOOL_USE_KEY, CLAUDE_PRE_MATCHER),
         (POST_TOOL_USE_KEY, CLAUDE_POST_MATCHER),
@@ -1016,7 +1017,9 @@ fn patch_settings_json_command(
         .copied()
         .filter(|(event_key, _)| !hook_already_present(&root, event_key, hook_command))
         .collect();
-    if missing.is_empty() {
+    let matcher_stale = missing.iter().all(|(k, _)| *k != POST_TOOL_USE_KEY)
+        && refresh_hook_matcher(&mut root, POST_TOOL_USE_KEY, CLAUDE_POST_MATCHER);
+    if missing.is_empty() && !matcher_stale {
         if verbose > 0 {
             eprintln!("settings.json: hook already present");
         }
@@ -1062,6 +1065,12 @@ fn patch_settings_json_command(
         for (event_key, matcher) in &missing {
             println!(
                 "[dry-run] would patch settings.json ({event_key}, matcher \"{matcher}\"): {}",
+                settings_path.display()
+            );
+        }
+        if matcher_stale {
+            println!(
+                "[dry-run] would update {POST_TOOL_USE_KEY} matcher to \"{CLAUDE_POST_MATCHER}\": {}",
                 settings_path.display()
             );
         }
@@ -1167,6 +1176,39 @@ fn insert_hook_entry(
         }]
     }));
     Ok(())
+}
+
+/// Update the matcher of RTK's own entries under `event_key` when it drifted
+/// from the current constant (e.g. Bash added to the PostToolUse matcher).
+/// Returns true if anything changed. Never touches non-RTK entries.
+fn refresh_hook_matcher(root: &mut serde_json::Value, event_key: &str, matcher: &str) -> bool {
+    let entries = match root
+        .get_mut("hooks")
+        .and_then(|h| h.get_mut(event_key))
+        .and_then(|p| p.as_array_mut())
+    {
+        Some(arr) => arr,
+        None => return false,
+    };
+
+    let mut changed = false;
+    for entry in entries.iter_mut() {
+        let has_rtk_command = entry
+            .get("hooks")
+            .and_then(|h| h.as_array())
+            .map(|hooks| {
+                hooks
+                    .iter()
+                    .filter_map(|hook| hook.get("command")?.as_str())
+                    .any(is_claude_hook_command)
+            })
+            .unwrap_or(false);
+        if has_rtk_command && entry.get("matcher").and_then(|m| m.as_str()) != Some(matcher) {
+            entry["matcher"] = serde_json::json!(matcher);
+            changed = true;
+        }
+    }
+    changed
 }
 
 /// Check if RTK hook is already present under the given event key.
@@ -6760,6 +6802,57 @@ mod tests {
         let hooks = post[0]["hooks"].as_array().unwrap();
         assert_eq!(hooks.len(), 1);
         assert_eq!(hooks[0]["command"].as_str().unwrap(), "/some/other/post.sh");
+    }
+
+    #[test]
+    fn test_refresh_hook_matcher_updates_stale_in_place() {
+        let mut json_content = serde_json::json!({
+            "hooks": {
+                "PostToolUse": [
+                    {
+                        "matcher": "Read|Grep|Glob|WebFetch|WebSearch",
+                        "hooks": [{ "type": "command", "command": CLAUDE_HOOK_COMMAND }]
+                    },
+                    {
+                        "matcher": "Write",
+                        "hooks": [{ "type": "command", "command": "/some/formatter.sh" }]
+                    }
+                ]
+            }
+        });
+
+        assert!(refresh_hook_matcher(
+            &mut json_content,
+            POST_TOOL_USE_KEY,
+            CLAUDE_POST_MATCHER
+        ));
+
+        let post = json_content["hooks"]["PostToolUse"].as_array().unwrap();
+        assert_eq!(post.len(), 2, "no duplicate entry");
+        assert_eq!(post[0]["matcher"].as_str().unwrap(), CLAUDE_POST_MATCHER);
+        assert_eq!(
+            post[1]["matcher"].as_str().unwrap(),
+            "Write",
+            "non-RTK entry untouched"
+        );
+    }
+
+    #[test]
+    fn test_refresh_hook_matcher_noop_when_current() {
+        let mut json_content = serde_json::json!({
+            "hooks": {
+                "PostToolUse": [{
+                    "matcher": CLAUDE_POST_MATCHER,
+                    "hooks": [{ "type": "command", "command": CLAUDE_HOOK_COMMAND }]
+                }]
+            }
+        });
+
+        assert!(!refresh_hook_matcher(
+            &mut json_content,
+            POST_TOOL_USE_KEY,
+            CLAUDE_POST_MATCHER
+        ));
     }
 
     #[test]

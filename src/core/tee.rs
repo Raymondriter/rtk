@@ -306,6 +306,12 @@ pub fn posthook_tee_hint(config: &Config, raw: &str, command_slug: &str) -> Opti
     Some(format_hint(&path))
 }
 
+/// Resolved posthook recall directory (for the recall-recovery gate: a
+/// command reading these files must not be post-filtered again).
+pub fn posthook_recall_dir(config: &Config) -> Option<PathBuf> {
+    get_tee_dir(config).map(|d| d.join(POSTHOOK_SUBDIR))
+}
+
 /// Convenience: tee + format hint in one call.
 /// Returns hint string if file was written, None if skipped.
 pub fn tee_and_hint(raw: &str, command_slug: &str, exit_code: i32) -> Option<String> {

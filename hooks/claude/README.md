@@ -10,7 +10,7 @@
 | Event | Matcher | Role |
 |-------|---------|------|
 | `PreToolUse` | `Bash` | Transparent command rewrite (`git status` → `rtk git status`) via `updatedInput` |
-| `PostToolUse` | `Read\|Grep\|Glob\|WebFetch\|WebSearch` | Output compression via `updatedToolOutput` (see `src/hooks/posthook.rs`) |
+| `PostToolUse` | `Bash\|Read\|Grep\|Glob\|WebFetch\|WebSearch` | Output compression via `updatedToolOutput` (see `src/hooks/posthook.rs`); Bash = generic floor for commands not rtk-rewritten |
 
 Both events run the same command; the binary dispatches on
 `hook_event_name`. No script files, no `jq` dependency, fail-open on every

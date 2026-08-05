@@ -53,12 +53,13 @@ exclude_commands = []       # commands to never auto-rewrite
 [posthook]
 enabled = true              # PostToolUse output filtering (Claude Code)
 exclude_paths = []          # globs vs file_path/url, e.g. ["**/*.min.js"]
-tools = { read = true, grep = true, webfetch = true, websearch = true, glob = false }
+tools = { read = true, grep = true, webfetch = true, websearch = true, glob = false, bash = true }
 
 [posthook.formats]          # per-format converter: "auto" | "off"
 json = "auto"
 web = "auto"
 lockfile = "auto"
+term = "auto"               # Bash generic floor
 ```
 
 For full details on what is collected, opt-out options, and GDPR rights, see [Telemetry & Privacy](../resources/telemetry.md).
@@ -115,8 +116,17 @@ model reads when (and only when) the filtered version is smaller:
 - **Base64 blobs** (embedded images, data URLs, fonts) — runs over ~1KB
   replaced with `[base64 image/png, 48 KB elided]` markers in JSON and web
   content; grep matches stay byte-faithful.
+- **Bash generic floor** — commands NOT rewritten by RTK get objective
+  byte-level cleanup: ANSI stripped, `\r` progress frames collapsed to the
+  final frame, runs of ≥3 identical lines collapsed with an explicit `[xN]`
+  marker, base64 blobs elided, and runaway outputs capped tail-biased
+  (head 50 + last 200 lines + `[N lines elided]`) with the full copy in the
+  recall file. rtk-prefixed commands are never double-processed, and reads
+  of the recall directory pass through raw.
 
-All chains are conversion-only: content is reformatted, never truncated.
+Native-tool chains are conversion-only: content is reformatted, never
+truncated. The Bash floor's `cap` is the one deliberate exception, and the
+recall file always holds the full output.
 
 Before filtering, the raw output is saved to
 `~/.local/share/rtk/tee/posthook/` (20-file rotation) and a

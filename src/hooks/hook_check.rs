@@ -1,7 +1,8 @@
 //! Detects whether RTK hooks are installed and warns if they are outdated.
 
 use super::constants::{
-    HOOKS_SUBDIR, POST_TOOL_USE_KEY, PRE_TOOL_USE_KEY, REWRITE_HOOK_FILE, SETTINGS_JSON,
+    CLAUDE_POST_MATCHER, HOOKS_SUBDIR, POST_TOOL_USE_KEY, PRE_TOOL_USE_KEY, REWRITE_HOOK_FILE,
+    SETTINGS_JSON,
 };
 use super::init::resolve_claude_dir;
 use super::is_claude_hook_command;
@@ -47,6 +48,11 @@ pub fn status() -> HookStatus {
         if !event_hook_registered(&claude_dir, POST_TOOL_USE_KEY) {
             return HookStatus::Outdated;
         }
+        // Registered but with a stale matcher (e.g. pre-Bash-floor install):
+        // `rtk init -g` refreshes it in place.
+        if !post_matcher_current(&claude_dir) {
+            return HookStatus::Outdated;
+        }
         return HookStatus::Ok;
     }
 
@@ -68,6 +74,38 @@ pub fn status() -> HookStatus {
 /// under the PreToolUse event (the rewrite hook).
 fn binary_hook_registered(claude_dir: &std::path::Path) -> bool {
     event_hook_registered(claude_dir, PRE_TOOL_USE_KEY)
+}
+
+/// Check whether at least one RTK entry under PostToolUse carries the
+/// current matcher.
+fn post_matcher_current(claude_dir: &std::path::Path) -> bool {
+    let settings_path = claude_dir.join(SETTINGS_JSON);
+    let content = match std::fs::read_to_string(&settings_path) {
+        Ok(c) if !c.trim().is_empty() => c,
+        _ => return false,
+    };
+    let root: serde_json::Value = match serde_json::from_str(&content) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    root.get("hooks")
+        .and_then(|h| h.get(POST_TOOL_USE_KEY))
+        .and_then(|p| p.as_array())
+        .into_iter()
+        .flatten()
+        .any(|entry| {
+            let has_rtk = entry
+                .get("hooks")
+                .and_then(|h| h.as_array())
+                .map(|hooks| {
+                    hooks
+                        .iter()
+                        .filter_map(|hook| hook.get("command")?.as_str())
+                        .any(is_claude_hook_command)
+                })
+                .unwrap_or(false);
+            has_rtk && entry.get("matcher").and_then(|m| m.as_str()) == Some(CLAUDE_POST_MATCHER)
+        })
 }
 
 /// Check if the native binary command is registered under the given event key.
@@ -264,6 +302,47 @@ mod tests {
 
         assert!(binary_hook_registered(tmp.path()));
         assert!(!event_hook_registered(tmp.path(), POST_TOOL_USE_KEY));
+    }
+
+    #[test]
+    fn test_post_matcher_stale_detected() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            tmp.path().join(SETTINGS_JSON),
+            r#"{
+                "hooks": {
+                    "PostToolUse": [{
+                        "matcher": "Read|Grep|Glob|WebFetch|WebSearch",
+                        "hooks": [{ "type": "command", "command": "rtk hook claude" }]
+                    }]
+                }
+            }"#,
+        )
+        .expect("write settings");
+
+        assert!(event_hook_registered(tmp.path(), POST_TOOL_USE_KEY));
+        assert!(!post_matcher_current(tmp.path()));
+    }
+
+    #[test]
+    fn test_post_matcher_current_with_bash() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            tmp.path().join(SETTINGS_JSON),
+            format!(
+                r#"{{
+                "hooks": {{
+                    "PostToolUse": [{{
+                        "matcher": "{CLAUDE_POST_MATCHER}",
+                        "hooks": [{{ "type": "command", "command": "rtk hook claude" }}]
+                    }}]
+                }}
+            }}"#
+            ),
+        )
+        .expect("write settings");
+
+        assert!(post_matcher_current(tmp.path()));
     }
 
     #[test]

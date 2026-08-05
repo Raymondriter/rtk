@@ -181,6 +181,8 @@ pub struct PosthookTools {
     pub webfetch: bool,
     pub websearch: bool,
     pub glob: bool,
+    /// Generic floor for Bash commands NOT rewritten by RTK.
+    pub bash: bool,
 }
 
 impl Default for PosthookTools {
@@ -191,6 +193,7 @@ impl Default for PosthookTools {
             webfetch: true,
             websearch: true,
             glob: false,
+            bash: true,
         }
     }
 }
@@ -201,6 +204,7 @@ pub struct PosthookFormats {
     pub json: String,
     pub web: String,
     pub lockfile: String,
+    pub term: String,
 }
 
 impl Default for PosthookFormats {
@@ -209,6 +213,7 @@ impl Default for PosthookFormats {
             json: "auto".into(),
             web: "auto".into(),
             lockfile: "auto".into(),
+            term: "auto".into(),
         }
     }
 }
@@ -370,9 +375,11 @@ history_days = 90
         assert!(config.posthook.tools.websearch);
         assert!(!config.posthook.tools.glob);
         assert!(config.posthook.exclude_paths.is_empty());
+        assert!(config.posthook.tools.bash);
         assert_eq!(config.posthook.formats.json, "auto");
         assert_eq!(config.posthook.formats.web, "auto");
         assert_eq!(config.posthook.formats.lockfile, "auto");
+        assert_eq!(config.posthook.formats.term, "auto");
     }
 
     #[test]
