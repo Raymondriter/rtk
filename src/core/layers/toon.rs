@@ -23,14 +23,17 @@ impl Layer for ToonLayer {
             return LayerOutcome::Continue(input.to_string());
         };
 
+        // ShortCircuit on conversion: encoded/minified output is data the
+        // model may need whole — a downstream truncate line-cap would chop a
+        // minified one-liner to 500 chars and silently destroy it.
         if is_uniform_flat_array(&value) {
             if let Ok(toon) = toon_format::encode_default(&value) {
                 if toon.len() < minified.len() {
-                    return LayerOutcome::Continue(toon);
+                    return LayerOutcome::ShortCircuit(toon);
                 }
             }
         }
-        LayerOutcome::Continue(minified)
+        LayerOutcome::ShortCircuit(minified)
     }
 }
 

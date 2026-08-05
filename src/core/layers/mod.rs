@@ -44,8 +44,8 @@ pub struct LayerCtx<'a> {
 pub enum LayerOutcome {
     /// Pass the (possibly transformed) content to the next layer.
     Continue(String),
-    /// Stop the chain and use this as the final output.
-    #[allow(dead_code)] // contract surface: no Part 1 layer short-circuits
+    /// Stop the chain and use this as the final output (e.g. `toon` after a
+    /// JSON conversion — later truncation would corrupt the encoded data).
     ShortCircuit(String),
 }
 
@@ -115,6 +115,25 @@ mod tests {
             .map(|l| l.name())
             .collect();
         assert_eq!(names, vec!["toon"]);
+    }
+
+    #[test]
+    fn test_web_chain_json_conversion_never_line_capped() {
+        // Nested JSON → toon falls back to minify → ONE long line. toon must
+        // ShortCircuit so truncate's 500-char line cap can't chop the data.
+        let ctx = LayerCtx {
+            format: ContentFormat::Web,
+            lang: Language::Unknown,
+            source: "https://api.example.com/big",
+        };
+        let items: Vec<String> = (0..200)
+            .map(|i| format!("{{\"k{i}\": {{\"nested\": \"value_{i}\"}}}}"))
+            .collect();
+        let input = format!("[\n  {}\n]", items.join(",\n  "));
+        let out = run_chain(chain_for(ContentFormat::Web), &input, &ctx);
+        assert!(out.len() > 2000, "minified one-liner must survive whole");
+        assert!(!out.ends_with("..."), "must not be line-capped");
+        serde_json::from_str::<serde_json::Value>(&out).expect("still valid JSON");
     }
 
     #[test]
