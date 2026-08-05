@@ -1218,6 +1218,7 @@ fn categorize_command(rtk_cmd: &str) -> String {
     match tool {
         "git" | "gh" | "gt" => "git",
         "cargo" => "cargo",
+        "posthook" => "posthook",
         "npm" | "npx" | "pnpm" | "vitest" | "tsc" | "lint" | "prettier" | "next" | "playwright"
         | "prisma" => "js",
         "pytest" | "ruff" | "mypy" | "pip" => "python",

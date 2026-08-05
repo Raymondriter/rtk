@@ -3958,7 +3958,23 @@ fn show_claude_config() -> Result<()> {
     if binary_hook_registered {
         println!("[ok] Hook: {} (native binary command)", CLAUDE_HOOK_COMMAND);
         if post_hook_registered {
-            println!("[ok] Posthook: registered (PostToolUse output filtering)");
+            let posthook = crate::core::config::posthook();
+            if posthook.enabled {
+                let tools: Vec<&str> = [
+                    ("read", posthook.tools.read),
+                    ("grep", posthook.tools.grep),
+                    ("glob", posthook.tools.glob),
+                    ("webfetch", posthook.tools.webfetch),
+                    ("websearch", posthook.tools.websearch),
+                ]
+                .iter()
+                .filter(|(_, on)| *on)
+                .map(|(name, _)| *name)
+                .collect();
+                println!("[ok] Posthook: on — {}", tools.join(", "));
+            } else {
+                println!("[--] Posthook: registered but disabled in config.toml");
+            }
         } else {
             println!("[warn] Posthook: not registered — run `rtk init -g` to add it");
         }

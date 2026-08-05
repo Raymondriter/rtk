@@ -212,7 +212,6 @@ impl Default for PosthookFormats {
 }
 
 /// Get posthook config. Falls back to defaults if config can't be loaded.
-#[allow(dead_code)] // consumed by the posthook runtime (src/hooks/posthook.rs)
 pub fn posthook() -> PosthookConfig {
     Config::load().map(|c| c.posthook).unwrap_or_default()
 }
