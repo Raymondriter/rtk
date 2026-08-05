@@ -111,27 +111,9 @@ fn create_tee_dir(tee_dir: &std::path::Path) -> Option<()> {
     crate::core::utils::create_private_dir(tee_dir).ok()
 }
 
-/// Write raw output to a tee file in the given directory.
-/// Returns file path on success.
-fn write_tee_file(
-    raw: &str,
-    command_slug: &str,
-    tee_dir: &std::path::Path,
-    max_file_size: usize,
-    max_files: usize,
-) -> Option<PathBuf> {
-    create_tee_dir(tee_dir)?;
-
-    let slug = sanitize_slug(command_slug);
-    let epoch = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .ok()?
-        .as_secs();
-    let filename = format!("{}_{}.log", epoch, slug);
-    let filepath = tee_dir.join(filename);
-
-    // Truncate at max_file_size (find a safe UTF-8 char boundary)
-    let content = if raw.len() > max_file_size {
+/// Truncate at max_file_size (find a safe UTF-8 char boundary).
+fn truncated_content(raw: &str, max_file_size: usize) -> String {
+    if raw.len() > max_file_size {
         let boundary = raw
             .char_indices()
             .take_while(|(i, _)| *i < max_file_size)
@@ -145,7 +127,20 @@ fn write_tee_file(
         )
     } else {
         raw.to_string()
-    };
+    }
+}
+
+/// Write `raw` (size-capped) under `filename` in `tee_dir`, then rotate.
+fn write_named_tee_file(
+    raw: &str,
+    filename: &str,
+    tee_dir: &std::path::Path,
+    max_file_size: usize,
+    max_files: usize,
+) -> Option<PathBuf> {
+    create_tee_dir(tee_dir)?;
+    let filepath = tee_dir.join(filename);
+    let content = truncated_content(raw, max_file_size);
 
     let mut file = crate::core::utils::open_private(
         std::fs::OpenOptions::new()
@@ -158,10 +153,27 @@ fn write_tee_file(
     use std::io::Write;
     file.write_all(content.as_bytes()).ok()?;
 
-    // Rotate old files
     cleanup_old_files(tee_dir, max_files);
 
     Some(filepath)
+}
+
+/// Write raw output to a tee file in the given directory.
+/// Returns file path on success.
+fn write_tee_file(
+    raw: &str,
+    command_slug: &str,
+    tee_dir: &std::path::Path,
+    max_file_size: usize,
+    max_files: usize,
+) -> Option<PathBuf> {
+    let slug = sanitize_slug(command_slug);
+    let epoch = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs();
+    let filename = format!("{}_{}.log", epoch, slug);
+    write_named_tee_file(raw, &filename, tee_dir, max_file_size, max_files)
 }
 
 /// Write raw output to tee file if conditions are met.
@@ -250,6 +262,48 @@ fn display_shell_path(path: &std::path::Path) -> String {
 
 fn format_hint(path: &std::path::Path) -> String {
     format!("[full output: {}]", display_shell_path(path))
+}
+
+/// Posthook recall store subdirectory (own rotation budget: posthook writes
+/// must never evict Bash-failure recovery logs).
+pub const POSTHOOK_SUBDIR: &str = "posthook";
+/// Rotation budget for the posthook recall store.
+const POSTHOOK_MAX_FILES: usize = 20;
+
+/// Write raw tool output to `<tee dir>/posthook/` before filtering and return
+/// the recall hint. Millisecond + pid filenames: epoch-second naming silently
+/// overwrites same-second writes (guaranteed at posthook rates), and the pid
+/// disambiguates concurrent hook processes (parallel subagents).
+///
+/// Takes `config` from the caller — the posthook path loads Config exactly
+/// once per invocation. Honors `RTK_TEE=0` and `tee.enabled` like every other
+/// tee write; per-file cap + truncation marker reused unchanged.
+pub fn posthook_tee_hint(config: &Config, raw: &str, command_slug: &str) -> Option<String> {
+    if std::env::var("RTK_TEE").ok().as_deref() == Some("0") {
+        return None;
+    }
+    if raw.is_empty() || !config.tee.enabled {
+        return None;
+    }
+
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    let dir = get_tee_dir(config)?.join(POSTHOOK_SUBDIR);
+    let slug = sanitize_slug(command_slug);
+    let epoch_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_millis();
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let filename = format!("{}_{}-{}_{}.log", epoch_ms, std::process::id(), seq, slug);
+    let path = write_named_tee_file(
+        raw,
+        &filename,
+        &dir,
+        config.tee.max_file_size,
+        POSTHOOK_MAX_FILES,
+    )?;
+    Some(format_hint(&path))
 }
 
 /// Convenience: tee + format hint in one call.
@@ -343,6 +397,41 @@ impl Default for TeeConfig {
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn test_posthook_tee_rotation_and_unique_filenames() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut config = Config::default();
+        config.tee.directory = Some(tmp.path().to_path_buf());
+
+        let raw = "x".repeat(600);
+        // 25 rapid writes with the same slug: same-ms writes must not
+        // overwrite each other, and rotation must keep only 20.
+        for _ in 0..25 {
+            let hint = posthook_tee_hint(&config, &raw, "read_data_json");
+            assert!(hint.is_some(), "tee enabled → hint expected");
+            assert!(hint.expect("hint").starts_with("[full output: "));
+        }
+
+        let posthook_dir = tmp.path().join(POSTHOOK_SUBDIR);
+        let count = fs::read_dir(&posthook_dir)
+            .expect("posthook dir exists")
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().is_some_and(|x| x == "log"))
+            .count();
+        assert_eq!(count, 20, "rotation budget is 20 files");
+    }
+
+    #[test]
+    fn test_posthook_tee_disabled_config() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut config = Config::default();
+        config.tee.directory = Some(tmp.path().to_path_buf());
+        config.tee.enabled = false;
+
+        assert!(posthook_tee_hint(&config, &"x".repeat(600), "slug").is_none());
+        assert!(!tmp.path().join(POSTHOOK_SUBDIR).exists());
+    }
 
     #[test]
     fn test_sanitize_slug() {

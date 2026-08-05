@@ -8,6 +8,8 @@ pub mod hook_cmd;
 pub mod init;
 pub mod integrity;
 pub mod permissions;
+#[deny(clippy::print_stdout, clippy::print_stderr)]
+pub mod posthook;
 pub mod rewrite_cmd;
 pub mod trust;
 pub mod verify_cmd;

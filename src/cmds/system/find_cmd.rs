@@ -8,23 +8,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 /// Match a filename against a glob pattern (supports `*` and `?`).
-fn glob_match(pattern: &str, name: &str) -> bool {
-    glob_match_inner(pattern.as_bytes(), name.as_bytes())
-}
-
-fn glob_match_inner(pat: &[u8], name: &[u8]) -> bool {
-    match (pat.first(), name.first()) {
-        (None, None) => true,
-        (Some(b'*'), _) => {
-            // '*' matches zero or more characters
-            glob_match_inner(&pat[1..], name)
-                || (!name.is_empty() && glob_match_inner(pat, &name[1..]))
-        }
-        (Some(b'?'), Some(_)) => glob_match_inner(&pat[1..], &name[1..]),
-        (Some(&p), Some(&n)) if p == n => glob_match_inner(&pat[1..], &name[1..]),
-        _ => false,
-    }
-}
+use crate::core::utils::glob_match;
 
 /// Parsed arguments from either native find or RTK find syntax.
 #[derive(Debug)]

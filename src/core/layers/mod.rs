@@ -10,9 +10,6 @@
 //! config. Reserved for Part 2: `dedup`, `unicode`, `ipynb-strip`,
 //! `tree-sitter`.
 
-// Wired by the posthook runtime (src/hooks/posthook.rs, next phase).
-#![allow(dead_code)]
-
 pub mod ansi;
 pub mod grep_group;
 pub mod minify_json;
@@ -33,7 +30,9 @@ pub enum ContentFormat {
     Matches,
 }
 
-/// Context passed to every layer in a chain.
+/// Context passed to every layer in a chain. `format`/`source` are part of
+/// the layer contract even where no Part 1 layer reads them yet.
+#[allow(dead_code)]
 pub struct LayerCtx<'a> {
     pub format: ContentFormat,
     /// Source language, for future code-aware layers.
@@ -46,11 +45,13 @@ pub enum LayerOutcome {
     /// Pass the (possibly transformed) content to the next layer.
     Continue(String),
     /// Stop the chain and use this as the final output.
+    #[allow(dead_code)] // contract surface: no Part 1 layer short-circuits
     ShortCircuit(String),
 }
 
 pub trait Layer: Sync {
-    /// Stable public identifier.
+    /// Stable public identifier (tracking + future config vocabulary).
+    #[allow(dead_code)]
     fn name(&self) -> &'static str;
     fn apply(&self, input: &str, ctx: &LayerCtx) -> LayerOutcome;
 }
@@ -69,6 +70,7 @@ pub fn run_chain(layers: &[&dyn Layer], input: &str, ctx: &LayerCtx) -> String {
 
 pub static ANSI: ansi::AnsiLayer = ansi::AnsiLayer;
 pub static TOON: toon::ToonLayer = toon::ToonLayer;
+#[allow(dead_code)] // frozen layer name; json chain minifies inside `toon`'s shape gate
 pub static MINIFY_JSON: minify_json::MinifyJsonLayer = minify_json::MinifyJsonLayer;
 pub static WEB_MD: web_md::WebMdLayer = web_md::WebMdLayer;
 pub static TRUNCATE: truncate::TruncateLayer = truncate::TruncateLayer;

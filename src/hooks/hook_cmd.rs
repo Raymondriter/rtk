@@ -481,9 +481,19 @@ fn process_claude_payload(v: &Value) -> PayloadAction {
     }
 }
 
-/// Run the Claude Code PreToolUse hook natively.
+/// Run the Claude Code hook natively. Dispatches on `hook_event_name`:
+/// PreToolUse (or absent, legacy tolerance) → rewrite flow; PostToolUse →
+/// output filtering; anything else → exit 0, no output.
 pub fn run_claude() -> Result<()> {
-    let input = read_stdin_limited()?;
+    // Fail-open on oversized stdin: an error here would surface a non-zero
+    // exit to the host; emitting nothing keeps the original tool output.
+    let input = match read_stdin_limited() {
+        Ok(i) => i,
+        Err(e) => {
+            let _ = writeln!(io::stderr(), "[rtk hook] {e}");
+            return Ok(());
+        }
+    };
 
     let input = input.trim();
     if input.is_empty() {
@@ -497,6 +507,17 @@ pub fn run_claude() -> Result<()> {
             return Ok(());
         }
     };
+
+    match v.get("hook_event_name").and_then(|e| e.as_str()) {
+        Some(super::constants::POST_TOOL_USE_KEY) => {
+            super::posthook::run(&v);
+            return Ok(());
+        }
+        // PreToolUse, or absent (older hosts / test payloads): rewrite flow.
+        Some(PRE_TOOL_USE_KEY) | None => {}
+        // Unknown event registered against this command: emit nothing.
+        Some(_) => return Ok(()),
+    }
 
     match process_claude_payload(&v) {
         PayloadAction::Rewrite {
