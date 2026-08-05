@@ -590,6 +590,40 @@ mod tests {
     }
 
     #[test]
+    fn test_never_worse_guard_hint_overhead_emits_nothing() {
+        let tee_dir = tempfile::tempdir().expect("tempdir");
+        let mut config = Config::default();
+        config.tee.directory = Some(tee_dir.path().to_path_buf());
+
+        let pairs: Vec<String> = (0..40).map(|i| format!("\"k{i}\":{i}")).collect();
+        let almost_min = format!("{{\n{}}}", pairs.join(",\n"));
+        let minified_len = serde_json::to_string(
+            &serde_json::from_str::<serde_json::Value>(&almost_min).expect("valid"),
+        )
+        .expect("serialize")
+        .len();
+        assert!(
+            almost_min.len() - minified_len < 60,
+            "premise: savings smaller than hint length"
+        );
+
+        let event = serde_json::json!({
+            "tool_name": "Read",
+            "tool_input": {"file_path": "/tmp/almost.json"},
+            "tool_response": {"type": "text", "file": {
+                "filePath": "/tmp/almost.json",
+                "content": almost_min,
+                "numLines": 42, "startLine": 1, "totalLines": 42
+            }},
+            "duration_ms": 1
+        });
+        assert!(
+            process_with_config(&event, &config).is_none(),
+            "composed (filtered+hint) > raw must emit nothing"
+        );
+    }
+
+    #[test]
     fn test_grep_count_mode_not_rewritten() {
         assert!(
             run_fixture("grep_count").is_none(),
