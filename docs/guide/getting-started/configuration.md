@@ -103,9 +103,12 @@ model reads when (and only when) the filtered version is smaller:
 - **Read of `.json` files** — uniform arrays of flat objects are re-encoded as
   [TOON](https://github.com/johannschopplich/toon); other JSON is minified.
   A note is attached telling the agent the on-disk file is unchanged.
-- **Grep (content mode)** — matches are grouped by file (`grep-group`).
+- **Grep (content mode)** — matches are grouped by file (`grep-group`),
+  losslessly: every match is kept.
 - **WebFetch / WebSearch** — ANSI stripping, HTML→Markdown when the response
-  is raw HTML, TOON/minify when the response body is raw JSON, truncation.
+  is raw HTML, TOON/minify when the response body is raw JSON.
+
+All chains are conversion-only: content is reformatted, never truncated.
 
 Before filtering, the raw output is saved to
 `~/.local/share/rtk/tee/posthook/` (20-file rotation) and a

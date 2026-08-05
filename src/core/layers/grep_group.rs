@@ -6,12 +6,11 @@
 //! Faithfulness guard: if any non-empty line does not parse as
 //! `path:line:content` (e.g. `-C` context lines using `-` separators), the
 //! whole input passes through unchanged — grouping must never drop lines.
+//! Lossless by design: every match is emitted (no per-file cap) — the
+//! posthook path converts, it never truncates.
 
 use super::{Layer, LayerCtx, LayerOutcome};
 use std::collections::HashMap;
-
-/// Per-file match cap, aligned with `LimitsConfig::grep_max_per_file`'s default.
-const MAX_MATCHES_PER_FILE: usize = 25;
 
 pub struct GrepGroupLayer;
 
@@ -51,11 +50,8 @@ impl Layer for GrepGroupLayer {
         for file in order {
             let matches = &by_file[file];
             out.push_str(&format!("[file] {} ({}):\n", file, matches.len()));
-            for (line_num, content) in matches.iter().take(MAX_MATCHES_PER_FILE) {
+            for (line_num, content) in matches {
                 out.push_str(&format!("  {:>4}: {}\n", line_num, content.trim()));
-            }
-            if matches.len() > MAX_MATCHES_PER_FILE {
-                out.push_str(&format!("  +{}\n", matches.len() - MAX_MATCHES_PER_FILE));
             }
             out.push('\n');
         }
@@ -121,13 +117,21 @@ mod tests {
     }
 
     #[test]
-    fn test_per_file_cap_emits_overflow_marker() {
+    fn test_all_matches_emitted_no_cap() {
         let input = (1..=40)
             .map(|i| format!("src/big.rs:{i}:let x = {i};"))
             .collect::<Vec<_>>()
             .join("\n");
         let out = apply(&input);
-        assert!(out.contains("+15"), "40 matches, cap 25 → +15: {out}");
+        assert!(out.starts_with("40 matches in 1F:"));
+        assert!(
+            out.contains("  40: let x = 40;"),
+            "last match present: {out}"
+        );
+        assert!(
+            !out.contains('+'),
+            "no overflow marker, grouping is lossless"
+        );
     }
 
     #[test]

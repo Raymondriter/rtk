@@ -19,13 +19,16 @@ hook (`src/hooks/posthook.rs`). This module sees only content + a
 Used in tracking rows and future config values — never rename.
 Reserved for Part 2: `dedup`, `unicode`, `ipynb-strip`, `tree-sitter`.
 
-## Part 1 chains (hardcoded, RTK-owned)
+## Part 1 chains (hardcoded, RTK-owned, conversion-only)
+
+Chains reformat content, they never drop it — no truncation on the posthook
+path. `truncate` exists as a reserved layer only.
 
 | Format | Chain | Notes |
 |--------|-------|-------|
 | `json` | `[toon]` | Shape-gated: uniform array of flat objects → TOON; else minified JSON; parse failure → passthrough |
-| `web` | `[ansi, web-md, toon, truncate]` | `web-md` skipped when content is already markdown-ish (tag-density sniff on first 1 KB); `toon` fires only when the body parses as JSON (raw API responses) |
-| `matches` | `[ansi, grep-group, truncate]` | `grep-group` passes through unchanged when any line is not `path:line:content` (context lines stay faithful) |
+| `web` | `[ansi, web-md, toon]` | `web-md` skipped when content is already markdown-ish (tag-density sniff on first 1 KB); `toon` fires only when the body parses as JSON (raw API responses) |
+| `matches` | `[ansi, grep-group]` | Lossless grouping (all matches emitted); passes through unchanged when any line is not `path:line:content` (context lines stay faithful) |
 
 ## Reuse map
 

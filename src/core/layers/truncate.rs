@@ -1,5 +1,8 @@
 //! `truncate` layer: per-line char cap (`utils::truncate`) + line windowing
 //! (`filter::smart_truncate`, `[N more lines]` trailer).
+//!
+//! Reserved: not in any Part 1 chain — the posthook path is conversion-only
+//! (maintainer decision), content is reformatted, never dropped.
 
 use super::{Layer, LayerCtx, LayerOutcome};
 use crate::core::filter::smart_truncate;

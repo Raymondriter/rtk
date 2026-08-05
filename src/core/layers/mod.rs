@@ -73,14 +73,18 @@ pub static TOON: toon::ToonLayer = toon::ToonLayer;
 #[allow(dead_code)] // frozen layer name; json chain minifies inside `toon`'s shape gate
 pub static MINIFY_JSON: minify_json::MinifyJsonLayer = minify_json::MinifyJsonLayer;
 pub static WEB_MD: web_md::WebMdLayer = web_md::WebMdLayer;
+#[allow(dead_code)] // reserved layer: no Part 1 chain truncates (conversion-only)
 pub static TRUNCATE: truncate::TruncateLayer = truncate::TruncateLayer;
 pub static GREP_GROUP: grep_group::GrepGroupLayer = grep_group::GrepGroupLayer;
 
+// Part 1 chains are conversion-only (maintainer decision): no truncation on
+// the posthook path — content is reformatted, never dropped. `truncate`
+// stays available as a reserved layer.
 static JSON_CHAIN: [&dyn Layer; 1] = [&TOON];
 // `toon` after `web-md`: fires only when the response body parses as JSON
 // (raw JSON API responses); markdown/HTML passes through it untouched.
-static WEB_CHAIN: [&dyn Layer; 4] = [&ANSI, &WEB_MD, &TOON, &TRUNCATE];
-static MATCHES_CHAIN: [&dyn Layer; 3] = [&ANSI, &GREP_GROUP, &TRUNCATE];
+static WEB_CHAIN: [&dyn Layer; 3] = [&ANSI, &WEB_MD, &TOON];
+static MATCHES_CHAIN: [&dyn Layer; 2] = [&ANSI, &GREP_GROUP];
 
 /// Hardcoded Part 1 chain per content format (RTK-owned; users get on/off
 /// per tool + per format + exclude_paths, not chain editing).
@@ -102,13 +106,13 @@ mod tests {
             .iter()
             .map(|l| l.name())
             .collect();
-        assert_eq!(names, vec!["ansi", "web-md", "toon", "truncate"]);
+        assert_eq!(names, vec!["ansi", "web-md", "toon"]);
 
         let names: Vec<&str> = chain_for(ContentFormat::Matches)
             .iter()
             .map(|l| l.name())
             .collect();
-        assert_eq!(names, vec!["ansi", "grep-group", "truncate"]);
+        assert_eq!(names, vec!["ansi", "grep-group"]);
 
         let names: Vec<&str> = chain_for(ContentFormat::Json)
             .iter()
