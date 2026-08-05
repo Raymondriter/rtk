@@ -21,6 +21,8 @@ pub struct Config {
     pub hooks: HooksConfig,
     #[serde(default)]
     pub limits: LimitsConfig,
+    #[serde(default)]
+    pub posthook: PosthookConfig,
 }
 
 #[derive(Debug, Serialize, Deserialize, Default)]
@@ -143,6 +145,76 @@ impl Default for LimitsConfig {
             passthrough_max_chars: 2000,
         }
     }
+}
+
+/// PostToolUse output-filter settings (`[posthook]` in config.toml).
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PosthookConfig {
+    pub enabled: bool,
+    /// Per-tool on/off toggles: where output comes from.
+    pub tools: PosthookTools,
+    /// Globs matched against `tool_input.file_path` / `tool_input.url`,
+    /// e.g. ["**/*.min.js"]. Matching paths pass through unfiltered.
+    pub exclude_paths: Vec<String>,
+    /// Per-format converter selection: what the content is.
+    /// Part 1 accepted values: "auto" | "off" (unknown strings = "auto").
+    pub formats: PosthookFormats,
+}
+
+impl Default for PosthookConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            tools: PosthookTools::default(),
+            exclude_paths: Vec::new(),
+            formats: PosthookFormats::default(),
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PosthookTools {
+    pub read: bool,
+    pub grep: bool,
+    pub webfetch: bool,
+    pub websearch: bool,
+    pub glob: bool,
+}
+
+impl Default for PosthookTools {
+    fn default() -> Self {
+        Self {
+            read: true,
+            grep: true,
+            webfetch: true,
+            websearch: true,
+            glob: false,
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PosthookFormats {
+    pub json: String,
+    pub web: String,
+}
+
+impl Default for PosthookFormats {
+    fn default() -> Self {
+        Self {
+            json: "auto".into(),
+            web: "auto".into(),
+        }
+    }
+}
+
+/// Get posthook config. Falls back to defaults if config can't be loaded.
+#[allow(dead_code)] // consumed by the posthook runtime (src/hooks/posthook.rs)
+pub fn posthook() -> PosthookConfig {
+    Config::load().map(|c| c.posthook).unwrap_or_default()
 }
 
 /// Get limits config. Falls back to defaults if config can't be loaded.
@@ -279,6 +351,80 @@ enabled = true
         let config = Config::default();
         assert!(!config.telemetry.enabled);
         assert!(config.telemetry.consent_given.is_none());
+    }
+
+    #[test]
+    fn test_posthook_defaults_when_section_missing() {
+        // Older configs that predate [posthook] must still parse, default-on.
+        let toml = r#"
+[tracking]
+enabled = true
+history_days = 90
+"#;
+        let config: Config = toml::from_str(toml).expect("valid toml");
+        assert!(config.posthook.enabled);
+        assert!(config.posthook.tools.read);
+        assert!(config.posthook.tools.grep);
+        assert!(config.posthook.tools.webfetch);
+        assert!(config.posthook.tools.websearch);
+        assert!(!config.posthook.tools.glob);
+        assert!(config.posthook.exclude_paths.is_empty());
+        assert_eq!(config.posthook.formats.json, "auto");
+        assert_eq!(config.posthook.formats.web, "auto");
+    }
+
+    #[test]
+    fn test_posthook_partial_section_fills_defaults() {
+        let toml = r#"
+[posthook]
+enabled = false
+"#;
+        let config: Config = toml::from_str(toml).expect("valid toml");
+        assert!(!config.posthook.enabled);
+        assert!(config.posthook.tools.read, "missing tools keep defaults");
+        assert_eq!(config.posthook.formats.json, "auto");
+    }
+
+    #[test]
+    fn test_posthook_roundtrip() {
+        let toml = r#"
+[posthook]
+enabled = true
+exclude_paths = ["**/*.min.js"]
+
+[posthook.tools]
+read = true
+grep = false
+webfetch = true
+websearch = true
+glob = true
+
+[posthook.formats]
+json = "off"
+web = "auto"
+"#;
+        let config: Config = toml::from_str(toml).expect("valid toml");
+        assert!(!config.posthook.tools.grep);
+        assert!(config.posthook.tools.glob);
+        assert_eq!(config.posthook.exclude_paths, vec!["**/*.min.js"]);
+        assert_eq!(config.posthook.formats.json, "off");
+
+        let serialized = toml::to_string_pretty(&config).expect("serialize");
+        let reparsed: Config = toml::from_str(&serialized).expect("reparse");
+        assert!(!reparsed.posthook.tools.grep);
+        assert_eq!(reparsed.posthook.formats.json, "off");
+    }
+
+    #[test]
+    fn test_posthook_inline_tools_table() {
+        // Spec template uses the inline-table form.
+        let toml = r#"
+[posthook]
+tools = { read = true, grep = true, webfetch = true, websearch = true, glob = false }
+"#;
+        let config: Config = toml::from_str(toml).expect("valid toml");
+        assert!(config.posthook.tools.read);
+        assert!(!config.posthook.tools.glob);
     }
 
     #[test]
