@@ -1,0 +1,22 @@
+{
+  "session_id": "2c0e2f1f-49c8-478f-a661-5ab75f055649",
+  "transcript_path": "/home/user/.claude/projects/-tmp-claude-1000--mnt-c-Users-adrie-WORKSPACES-RTK-AI-LABS-rtk-cddc5cf7-f791-40fa-a281-23010b5a36e7-scratchpad-p0-proj/2c0e2f1f-49c8-478f-a661-5ab75f055649.jsonl",
+  "cwd": "/home/user/project",
+  "prompt_id": "726c1ce2-c3c7-4951-9b26-7f01fdeb9ddf",
+  "permission_mode": "default",
+  "hook_event_name": "PostToolUse",
+  "tool_name": "Grep",
+  "tool_input": {
+    "pattern": "process_alpha",
+    "output_mode": "count"
+  },
+  "tool_response": {
+    "mode": "count",
+    "numFiles": 1,
+    "filenames": [],
+    "content": "haystack.rs:43",
+    "numMatches": 43
+  },
+  "tool_use_id": "toolu_01E26eNkrsAkdNKwDgXdJwjv",
+  "duration_ms": 10
+}

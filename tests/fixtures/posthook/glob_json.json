@@ -1,0 +1,27 @@
+{
+  "session_id": "8a02a4d8-fe41-4157-ae20-ee046890b71b",
+  "transcript_path": "/home/user/.claude/projects/-tmp-claude-1000--mnt-c-Users-adrie-WORKSPACES-RTK-AI-LABS-rtk-cddc5cf7-f791-40fa-a281-23010b5a36e7-scratchpad-p0-proj/8a02a4d8-fe41-4157-ae20-ee046890b71b.jsonl",
+  "cwd": "/home/user/project",
+  "prompt_id": "58e556e8-fcec-40da-8812-595faffd546b",
+  "permission_mode": "default",
+  "hook_event_name": "PostToolUse",
+  "tool_name": "Glob",
+  "tool_input": {
+    "pattern": "*.json"
+  },
+  "tool_response": {
+    "filenames": [
+      "data_flat.json",
+      "data_nested.json",
+      "data_huge.json",
+      ".claude/settings.json"
+    ],
+    "durationMs": 6,
+    "numFiles": 4,
+    "truncated": false,
+    "totalMatches": 4,
+    "countIsComplete": true
+  },
+  "tool_use_id": "toolu_01KA2rKqyKRzVcATyfsq4JZB",
+  "duration_ms": 7
+}
