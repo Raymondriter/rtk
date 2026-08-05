@@ -6,10 +6,15 @@ pub const SETTINGS_JSON: &str = "settings.json";
 pub const SETTINGS_LOCAL_JSON: &str = "settings.local.json";
 pub const HOOKS_JSON: &str = "hooks.json";
 pub const PRE_TOOL_USE_KEY: &str = "PreToolUse";
+pub const POST_TOOL_USE_KEY: &str = "PostToolUse";
 pub const BEFORE_TOOL_KEY: &str = "BeforeTool";
 
 /// Native Rust hook command for Claude Code (replaces rtk-rewrite.sh).
 pub const CLAUDE_HOOK_COMMAND: &str = "rtk hook claude";
+/// Tool matcher for the Claude Code PreToolUse rewrite hook.
+pub const CLAUDE_PRE_MATCHER: &str = "Bash";
+/// Tool matcher for the Claude Code PostToolUse output-filter hook.
+pub const CLAUDE_POST_MATCHER: &str = "Read|Grep|Glob|WebFetch|WebSearch";
 /// Native Rust hook command for Cursor (replaces rtk-rewrite.sh).
 pub const CURSOR_HOOK_COMMAND: &str = "rtk hook cursor";
 /// Native Rust hook command for Factory Droid.

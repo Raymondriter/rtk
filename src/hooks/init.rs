@@ -13,12 +13,13 @@ use crate::hooks::constants::{
 };
 
 use super::constants::{
-    BEFORE_TOOL_KEY, CLAUDE_DIR, CLAUDE_HOOK_COMMAND, CODEX_DIR, CURSOR_HOOK_COMMAND, DROID_DIR,
-    DROID_EXECUTE_MATCHER, DROID_HOME_ENV, DROID_HOOKS_FILE, DROID_HOOKS_SUBDIR,
-    DROID_HOOK_COMMAND, DROID_SETTINGS_FILE, GEMINI_HOOK_FILE, HERMES_DIR, HERMES_PLUGINS_SUBDIR,
-    HERMES_PLUGIN_INIT_FILE, HERMES_PLUGIN_MANIFEST_FILE, HERMES_PLUGIN_NAME, HOOKS_JSON,
-    HOOKS_SUBDIR, PI_CODING_AGENT_DIR_ENV, PI_DIR, PI_EXTENSIONS_SUBDIR, PI_LOCAL_DIR,
-    PI_PLUGIN_FILE, PRE_TOOL_USE_KEY, REWRITE_HOOK_FILE, SETTINGS_JSON,
+    BEFORE_TOOL_KEY, CLAUDE_DIR, CLAUDE_HOOK_COMMAND, CLAUDE_POST_MATCHER, CLAUDE_PRE_MATCHER,
+    CODEX_DIR, CURSOR_HOOK_COMMAND, DROID_DIR, DROID_EXECUTE_MATCHER, DROID_HOME_ENV,
+    DROID_HOOKS_FILE, DROID_HOOKS_SUBDIR, DROID_HOOK_COMMAND, DROID_SETTINGS_FILE,
+    GEMINI_HOOK_FILE, HERMES_DIR, HERMES_PLUGINS_SUBDIR, HERMES_PLUGIN_INIT_FILE,
+    HERMES_PLUGIN_MANIFEST_FILE, HERMES_PLUGIN_NAME, HOOKS_JSON, HOOKS_SUBDIR,
+    PI_CODING_AGENT_DIR_ENV, PI_DIR, PI_EXTENSIONS_SUBDIR, PI_LOCAL_DIR, PI_PLUGIN_FILE,
+    POST_TOOL_USE_KEY, PRE_TOOL_USE_KEY, REWRITE_HOOK_FILE, SETTINGS_JSON,
 };
 use super::integrity;
 use super::is_claude_hook_command;
@@ -547,36 +548,65 @@ fn print_manual_instructions(hook_command: &str, include_opencode: bool) {
     }
 }
 
+/// Remove RTK hooks from settings.json across both Claude events, preserving
+/// non-RTK entries even inside shared matcher groups (Droid-model cleanup).
 fn remove_hook_from_json(root: &mut serde_json::Value) -> bool {
-    let hooks = match root
-        .get_mut("hooks")
-        .and_then(|h| h.get_mut(PRE_TOOL_USE_KEY))
-    {
-        Some(pre_tool_use) => pre_tool_use,
+    let hooks_obj = match root.get_mut("hooks").and_then(|h| h.as_object_mut()) {
+        Some(o) => o,
         None => return false,
     };
 
-    let pre_tool_use_array = match hooks.as_array_mut() {
-        Some(arr) => arr,
-        None => return false,
-    };
+    let mut modified = false;
 
-    let original_len = pre_tool_use_array.len();
-    pre_tool_use_array.retain(|entry| {
-        if let Some(hooks_array) = entry.get("hooks").and_then(|h| h.as_array()) {
-            for hook in hooks_array {
-                if let Some(command) = hook.get("command").and_then(|c| c.as_str()) {
-                    // Match both legacy script path and new binary command
-                    if command.contains(REWRITE_HOOK_FILE) || is_claude_hook_command(command) {
-                        return false;
-                    }
+    for event_key in [PRE_TOOL_USE_KEY, POST_TOOL_USE_KEY] {
+        let event_array = match hooks_obj.get_mut(event_key).and_then(|p| p.as_array_mut()) {
+            Some(arr) => arr,
+            None => continue,
+        };
+
+        // Remove RTK hooks from within matcher groups (legacy script path or
+        // binary command), keeping co-located non-RTK hooks.
+        let mut event_modified = false;
+        for entry in event_array.iter_mut() {
+            if let Some(hook_arr) = entry.get_mut("hooks").and_then(|h| h.as_array_mut()) {
+                let original = hook_arr.len();
+                hook_arr.retain(|hook| {
+                    hook.get("command")
+                        .and_then(|c| c.as_str())
+                        .is_none_or(|cmd| {
+                            !(cmd.contains(REWRITE_HOOK_FILE) || is_claude_hook_command(cmd))
+                        })
+                });
+                if hook_arr.len() < original {
+                    event_modified = true;
                 }
             }
         }
-        true
-    });
 
-    pre_tool_use_array.len() < original_len
+        // Drop matcher entries that lost all their hooks.
+        if event_modified {
+            event_array.retain(|entry| {
+                entry
+                    .get("hooks")
+                    .and_then(|h| h.as_array())
+                    .map(|a| !a.is_empty())
+                    .unwrap_or(true)
+            });
+            if event_array.is_empty() {
+                hooks_obj.remove(event_key);
+            }
+            modified = true;
+        }
+    }
+
+    // Drop the then-empty hooks object.
+    if modified && hooks_obj.is_empty() {
+        if let Some(obj) = root.as_object_mut() {
+            obj.remove("hooks");
+        }
+    }
+
+    modified
 }
 
 /// Remove RTK hook from settings.json file
@@ -976,15 +1006,24 @@ fn patch_settings_json_command(
         serde_json::json!({})
     };
 
-    // Check idempotency
-    if hook_already_present(&root, hook_command) {
+    // Check idempotency per event (a pre-only install still needs the post hook)
+    let events = [
+        (PRE_TOOL_USE_KEY, CLAUDE_PRE_MATCHER),
+        (POST_TOOL_USE_KEY, CLAUDE_POST_MATCHER),
+    ];
+    let missing: Vec<(&str, &str)> = events
+        .iter()
+        .copied()
+        .filter(|(event_key, _)| !hook_already_present(&root, event_key, hook_command))
+        .collect();
+    if missing.is_empty() {
         if verbose > 0 {
             eprintln!("settings.json: hook already present");
         }
         return Ok(PatchResult::AlreadyPresent);
     }
 
-    // Handle mode
+    // Handle mode (one consent prompt covers both events)
     match mode {
         PatchMode::Skip => {
             print_manual_instructions(hook_command, include_opencode);
@@ -997,9 +1036,14 @@ fn patch_settings_json_command(
                     "[dry-run] would prompt before patching {}",
                     settings_path.display()
                 );
-            } else if !prompt_user_consent(&settings_path)? {
-                print_manual_instructions(hook_command, include_opencode);
-                return Ok(PatchResult::Declined);
+            } else {
+                eprintln!(
+                    "\nRTK registers `{hook_command}` to rewrite Bash commands (PreToolUse)\nand compress tool outputs (PostToolUse)."
+                );
+                if !prompt_user_consent(&settings_path)? {
+                    print_manual_instructions(hook_command, include_opencode);
+                    return Ok(PatchResult::Declined);
+                }
             }
         }
         PatchMode::Auto => {
@@ -1007,16 +1051,20 @@ fn patch_settings_json_command(
         }
     }
 
-    insert_hook_entry(&mut root, hook_command)?;
+    for (event_key, matcher) in &missing {
+        insert_hook_entry(&mut root, event_key, matcher, hook_command)?;
+    }
 
     let serialized =
         serde_json::to_string_pretty(&root).context("Failed to serialize settings.json")?;
 
     if dry_run {
-        println!(
-            "[dry-run] would patch settings.json: {}",
-            settings_path.display()
-        );
+        for (event_key, matcher) in &missing {
+            println!(
+                "[dry-run] would patch settings.json ({event_key}, matcher \"{matcher}\"): {}",
+                settings_path.display()
+            );
+        }
         if verbose > 0 {
             println!("[dry-run] content:\n{}", serialized);
         }
@@ -1082,9 +1130,15 @@ fn clean_double_blanks(content: &str) -> String {
     result.join("\n")
 }
 
-/// Deep-merge RTK hook entry into settings.json
-/// Creates hooks.PreToolUse structure if missing, preserves existing hooks
-fn insert_hook_entry(root: &mut serde_json::Value, hook_command: &str) -> Result<()> {
+/// Deep-merge RTK hook entry into settings.json under the given event key
+/// (PreToolUse, PostToolUse, ...). Creates the structure if missing,
+/// preserves existing hooks.
+fn insert_hook_entry(
+    root: &mut serde_json::Value,
+    event_key: &str,
+    matcher: &str,
+    hook_command: &str,
+) -> Result<()> {
     let root_obj = match root.as_object_mut() {
         Some(obj) => obj,
         None => {
@@ -1099,14 +1153,14 @@ fn insert_hook_entry(root: &mut serde_json::Value, hook_command: &str) -> Result
         .as_object_mut()
         .context("hooks value is not an object")?;
 
-    let pre_tool_use = hooks
-        .entry(PRE_TOOL_USE_KEY)
+    let event_array = hooks
+        .entry(event_key)
         .or_insert_with(|| serde_json::json!([]))
         .as_array_mut()
-        .context("PreToolUse value is not an array")?;
+        .with_context(|| format!("{event_key} value is not an array"))?;
 
-    pre_tool_use.push(serde_json::json!({
-        "matcher": "Bash",
+    event_array.push(serde_json::json!({
+        "matcher": matcher,
         "hooks": [{
             "type": "command",
             "command": hook_command
@@ -1115,19 +1169,19 @@ fn insert_hook_entry(root: &mut serde_json::Value, hook_command: &str) -> Result
     Ok(())
 }
 
-/// Check if RTK hook is already present in settings.json
+/// Check if RTK hook is already present under the given event key.
 /// Matches on legacy rtk-rewrite.sh path OR new `rtk hook claude` command
-fn hook_already_present(root: &serde_json::Value, hook_command: &str) -> bool {
-    let pre_tool_use_array = match root
+fn hook_already_present(root: &serde_json::Value, event_key: &str, hook_command: &str) -> bool {
+    let event_array = match root
         .get("hooks")
-        .and_then(|h| h.get(PRE_TOOL_USE_KEY))
+        .and_then(|h| h.get(event_key))
         .and_then(|p| p.as_array())
     {
         Some(arr) => arr,
         None => return false,
     };
 
-    pre_tool_use_array
+    event_array
         .iter()
         .filter_map(|entry| entry.get("hooks")?.as_array())
         .flatten()
@@ -3887,19 +3941,27 @@ fn show_claude_config() -> Result<()> {
 
     // Check hook: prefer binary command detection, fall back to script file
     let settings_path = claude_dir.join(SETTINGS_JSON);
-    let binary_hook_registered = if settings_path.exists() {
+    let (binary_hook_registered, post_hook_registered) = if settings_path.exists() {
         let content = fs::read_to_string(&settings_path).unwrap_or_default();
         if let Ok(root) = serde_json::from_str::<serde_json::Value>(&content) {
-            hook_already_present(&root, CLAUDE_HOOK_COMMAND)
+            (
+                hook_already_present(&root, PRE_TOOL_USE_KEY, CLAUDE_HOOK_COMMAND),
+                hook_already_present(&root, POST_TOOL_USE_KEY, CLAUDE_HOOK_COMMAND),
+            )
         } else {
-            false
+            (false, false)
         }
     } else {
-        false
+        (false, false)
     };
 
     if binary_hook_registered {
         println!("[ok] Hook: {} (native binary command)", CLAUDE_HOOK_COMMAND);
+        if post_hook_registered {
+            println!("[ok] Posthook: registered (PostToolUse output filtering)");
+        } else {
+            println!("[warn] Posthook: not registered — run `rtk init -g` to add it");
+        }
     } else if hook_path.exists() {
         #[cfg(unix)]
         {
@@ -4011,8 +4073,13 @@ fn show_claude_config() -> Result<()> {
         let content = fs::read_to_string(&settings_path)?;
         if !content.trim().is_empty() {
             if let Ok(root) = serde_json::from_str::<serde_json::Value>(&content) {
-                if hook_already_present(&root, CLAUDE_HOOK_COMMAND) {
-                    println!("[ok] settings.json: RTK hook configured");
+                let pre = hook_already_present(&root, PRE_TOOL_USE_KEY, CLAUDE_HOOK_COMMAND);
+                let post = hook_already_present(&root, POST_TOOL_USE_KEY, CLAUDE_HOOK_COMMAND);
+                if pre && post {
+                    println!("[ok] settings.json: RTK hooks configured (PreToolUse + PostToolUse)");
+                } else if pre {
+                    println!("[warn] settings.json: PostToolUse hook missing");
+                    println!("    Run: rtk init -g --auto-patch");
                 } else {
                     println!("[warn] settings.json: exists but RTK hook not configured");
                     println!("    Run: rtk init -g --auto-patch");
@@ -6166,7 +6233,11 @@ mod tests {
         });
 
         let hook_command = "/Users/test/.claude/hooks/rtk-rewrite.sh";
-        assert!(hook_already_present(&json_content, hook_command));
+        assert!(hook_already_present(
+            &json_content,
+            PRE_TOOL_USE_KEY,
+            hook_command
+        ));
     }
 
     #[test]
@@ -6185,14 +6256,22 @@ mod tests {
 
         let hook_command = "~/.claude/hooks/rtk-rewrite.sh";
         // Should match on rtk-rewrite.sh substring
-        assert!(hook_already_present(&json_content, hook_command));
+        assert!(hook_already_present(
+            &json_content,
+            PRE_TOOL_USE_KEY,
+            hook_command
+        ));
     }
 
     #[test]
     fn test_hook_not_present_empty() {
         let json_content = serde_json::json!({});
         let hook_command = "/Users/test/.claude/hooks/rtk-rewrite.sh";
-        assert!(!hook_already_present(&json_content, hook_command));
+        assert!(!hook_already_present(
+            &json_content,
+            PRE_TOOL_USE_KEY,
+            hook_command
+        ));
     }
 
     #[test]
@@ -6209,7 +6288,11 @@ mod tests {
             }
         });
 
-        assert!(hook_already_present(&json_content, CLAUDE_HOOK_COMMAND));
+        assert!(hook_already_present(
+            &json_content,
+            PRE_TOOL_USE_KEY,
+            CLAUDE_HOOK_COMMAND
+        ));
     }
 
     #[test]
@@ -6227,7 +6310,11 @@ mod tests {
             }
         });
 
-        assert!(hook_already_present(&json_content, CLAUDE_HOOK_COMMAND));
+        assert!(hook_already_present(
+            &json_content,
+            PRE_TOOL_USE_KEY,
+            CLAUDE_HOOK_COMMAND
+        ));
     }
 
     #[test]
@@ -6245,7 +6332,11 @@ mod tests {
         });
 
         let hook_command = "/Users/test/.claude/hooks/rtk-rewrite.sh";
-        assert!(!hook_already_present(&json_content, hook_command));
+        assert!(!hook_already_present(
+            &json_content,
+            PRE_TOOL_USE_KEY,
+            hook_command
+        ));
     }
 
     // Tests for insert_hook_entry()
@@ -6254,7 +6345,13 @@ mod tests {
         let mut json_content = serde_json::json!({});
         let hook_command = "/Users/test/.claude/hooks/rtk-rewrite.sh";
 
-        insert_hook_entry(&mut json_content, hook_command).unwrap();
+        insert_hook_entry(
+            &mut json_content,
+            PRE_TOOL_USE_KEY,
+            CLAUDE_PRE_MATCHER,
+            hook_command,
+        )
+        .unwrap();
 
         // Should create full structure
         assert!(json_content.get("hooks").is_some());
@@ -6286,7 +6383,13 @@ mod tests {
         });
 
         let hook_command = "/Users/test/.claude/hooks/rtk-rewrite.sh";
-        insert_hook_entry(&mut json_content, hook_command).unwrap();
+        insert_hook_entry(
+            &mut json_content,
+            PRE_TOOL_USE_KEY,
+            CLAUDE_PRE_MATCHER,
+            hook_command,
+        )
+        .unwrap();
 
         let pre_tool_use = json_content["hooks"]["PreToolUse"].as_array().unwrap();
         assert_eq!(pre_tool_use.len(), 2); // Should have both hooks
@@ -6309,7 +6412,13 @@ mod tests {
         });
 
         let hook_command = "/Users/test/.claude/hooks/rtk-rewrite.sh";
-        insert_hook_entry(&mut json_content, hook_command).unwrap();
+        insert_hook_entry(
+            &mut json_content,
+            PRE_TOOL_USE_KEY,
+            CLAUDE_PRE_MATCHER,
+            hook_command,
+        )
+        .unwrap();
 
         // Should preserve all other keys
         assert_eq!(json_content["env"]["PATH"], "/custom/path");
@@ -6533,6 +6642,130 @@ mod tests {
 
         let removed = remove_hook_from_json(&mut json_content);
         assert!(!removed);
+    }
+
+    #[test]
+    fn test_insert_hook_entry_posthook_event() {
+        let mut json_content = serde_json::json!({});
+        insert_hook_entry(
+            &mut json_content,
+            POST_TOOL_USE_KEY,
+            CLAUDE_POST_MATCHER,
+            CLAUDE_HOOK_COMMAND,
+        )
+        .unwrap();
+
+        let post = json_content["hooks"]["PostToolUse"].as_array().unwrap();
+        assert_eq!(post.len(), 1);
+        assert_eq!(post[0]["matcher"].as_str().unwrap(), CLAUDE_POST_MATCHER);
+        assert_eq!(
+            post[0]["hooks"][0]["command"].as_str().unwrap(),
+            CLAUDE_HOOK_COMMAND
+        );
+    }
+
+    #[test]
+    fn test_hook_already_present_is_per_event() {
+        // Pre-only install: pre present, post missing (upgrader scenario)
+        let json_content = serde_json::json!({
+            "hooks": {
+                "PreToolUse": [{
+                    "matcher": "Bash",
+                    "hooks": [{ "type": "command", "command": CLAUDE_HOOK_COMMAND }]
+                }]
+            }
+        });
+
+        assert!(hook_already_present(
+            &json_content,
+            PRE_TOOL_USE_KEY,
+            CLAUDE_HOOK_COMMAND
+        ));
+        assert!(!hook_already_present(
+            &json_content,
+            POST_TOOL_USE_KEY,
+            CLAUDE_HOOK_COMMAND
+        ));
+    }
+
+    #[test]
+    fn test_remove_hook_from_json_both_events_preserves_unrelated() {
+        let mut json_content = serde_json::json!({
+            "hooks": {
+                "PreToolUse": [{
+                    "matcher": "Bash",
+                    "hooks": [{ "type": "command", "command": CLAUDE_HOOK_COMMAND }]
+                }],
+                "PostToolUse": [
+                    {
+                        "matcher": "Read|Grep|Glob|WebFetch|WebSearch",
+                        "hooks": [{ "type": "command", "command": CLAUDE_HOOK_COMMAND }]
+                    },
+                    {
+                        "matcher": "Write",
+                        "hooks": [{ "type": "command", "command": "/some/formatter.sh" }]
+                    }
+                ]
+            }
+        });
+
+        assert!(remove_hook_from_json(&mut json_content));
+
+        // RTK gone from both events, unrelated PostToolUse entry preserved
+        assert!(json_content["hooks"].get("PreToolUse").is_none());
+        let post = json_content["hooks"]["PostToolUse"].as_array().unwrap();
+        assert_eq!(post.len(), 1);
+        assert_eq!(
+            post[0]["hooks"][0]["command"].as_str().unwrap(),
+            "/some/formatter.sh"
+        );
+    }
+
+    #[test]
+    fn test_remove_hook_from_json_shared_matcher_group() {
+        // RTK hook co-located with a non-RTK hook inside the same matcher
+        // group: only the RTK hook is removed, the group survives.
+        let mut json_content = serde_json::json!({
+            "hooks": {
+                "PostToolUse": [{
+                    "matcher": "Read|Grep|Glob|WebFetch|WebSearch",
+                    "hooks": [
+                        { "type": "command", "command": CLAUDE_HOOK_COMMAND },
+                        { "type": "command", "command": "/some/other/post.sh" }
+                    ]
+                }]
+            }
+        });
+
+        assert!(remove_hook_from_json(&mut json_content));
+
+        let post = json_content["hooks"]["PostToolUse"].as_array().unwrap();
+        assert_eq!(post.len(), 1);
+        let hooks = post[0]["hooks"].as_array().unwrap();
+        assert_eq!(hooks.len(), 1);
+        assert_eq!(hooks[0]["command"].as_str().unwrap(), "/some/other/post.sh");
+    }
+
+    #[test]
+    fn test_remove_hook_from_json_drops_empty_hooks_object() {
+        let mut json_content = serde_json::json!({
+            "model": "claude-sonnet-4",
+            "hooks": {
+                "PreToolUse": [{
+                    "matcher": "Bash",
+                    "hooks": [{ "type": "command", "command": CLAUDE_HOOK_COMMAND }]
+                }],
+                "PostToolUse": [{
+                    "matcher": "Read|Grep|Glob|WebFetch|WebSearch",
+                    "hooks": [{ "type": "command", "command": CLAUDE_HOOK_COMMAND }]
+                }]
+            }
+        });
+
+        assert!(remove_hook_from_json(&mut json_content));
+
+        assert!(json_content.get("hooks").is_none());
+        assert_eq!(json_content["model"], "claude-sonnet-4");
     }
 
     // ─── Cursor hooks.json tests ───
@@ -6901,7 +7134,48 @@ mod tests {
 
             let settings = fs::read_to_string(claude_dir.join(SETTINGS_JSON)).unwrap();
             let count = settings.matches(CLAUDE_HOOK_COMMAND).count();
-            assert_eq!(count, 1, "hook command must appear exactly once");
+            assert_eq!(
+                count, 2,
+                "hook command must appear exactly once per event (PreToolUse + PostToolUse)"
+            );
+
+            let root: serde_json::Value = serde_json::from_str(&settings).unwrap();
+            for event in [PRE_TOOL_USE_KEY, POST_TOOL_USE_KEY] {
+                let arr = root["hooks"][event].as_array().unwrap();
+                assert_eq!(arr.len(), 1, "{event} must hold exactly one entry");
+            }
+        });
+    }
+
+    #[test]
+    fn test_global_default_mode_backfills_missing_posthook() {
+        // Upgrader scenario: settings.json already has the PreToolUse hook
+        // (older install); re-running init must add only the PostToolUse hook.
+        let tmp = TempDir::new().unwrap();
+        with_claude_dir_override(&tmp, |claude_dir| {
+            fs::create_dir_all(claude_dir).unwrap();
+            fs::write(
+                claude_dir.join(SETTINGS_JSON),
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "hooks": {
+                        "PreToolUse": [{
+                            "matcher": "Bash",
+                            "hooks": [{ "type": "command", "command": CLAUDE_HOOK_COMMAND }]
+                        }]
+                    }
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+
+            run_default_mode(true, PatchMode::Auto, false, InitContext::default()).unwrap();
+
+            let settings = fs::read_to_string(claude_dir.join(SETTINGS_JSON)).unwrap();
+            let root: serde_json::Value = serde_json::from_str(&settings).unwrap();
+            assert_eq!(root["hooks"][PRE_TOOL_USE_KEY].as_array().unwrap().len(), 1);
+            let post = root["hooks"][POST_TOOL_USE_KEY].as_array().unwrap();
+            assert_eq!(post.len(), 1, "PostToolUse hook must be backfilled");
+            assert_eq!(post[0]["matcher"].as_str().unwrap(), CLAUDE_POST_MATCHER);
         });
     }
 

@@ -11,7 +11,10 @@ use std::io::{self, Read, Write};
 
 use crate::discover::registry::{has_heredoc, rewrite_command};
 
-const STDIN_CAP: usize = 1_048_576; // 1 MiB
+// Aligned with stream::RAW_CAP: PostToolUse events carry whole tool outputs
+// (Read/WebFetch responses), which overflow the old 1 MiB cap — an over-cap
+// event would be silently rejected and therefore silently unfiltered.
+const STDIN_CAP: usize = 10_485_760; // 10 MiB
 
 fn read_stdin_limited() -> Result<String> {
     let mut input = String::new();

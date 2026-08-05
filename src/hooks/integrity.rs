@@ -12,7 +12,7 @@
 //!
 //! Reference: SA-2025-RTK-001 (Finding F-01)
 
-use super::constants::{HOOKS_SUBDIR, PRE_TOOL_USE_KEY, REWRITE_HOOK_FILE};
+use super::constants::{HOOKS_SUBDIR, POST_TOOL_USE_KEY, PRE_TOOL_USE_KEY, REWRITE_HOOK_FILE};
 use super::init::resolve_claude_dir;
 use super::is_claude_hook_command;
 use anyhow::{Context, Result};
@@ -368,15 +368,17 @@ fn settings_has_claude_hook(content: &str) -> bool {
         return false;
     };
 
-    root.get("hooks")
-        .and_then(|h| h.get(PRE_TOOL_USE_KEY))
-        .and_then(|p| p.as_array())
-        .into_iter()
-        .flatten()
-        .filter_map(|entry| entry.get("hooks")?.as_array())
-        .flatten()
-        .filter_map(|hook| hook.get("command")?.as_str())
-        .any(is_claude_hook_command)
+    [PRE_TOOL_USE_KEY, POST_TOOL_USE_KEY].iter().any(|event| {
+        root.get("hooks")
+            .and_then(|h| h.get(event))
+            .and_then(|p| p.as_array())
+            .into_iter()
+            .flatten()
+            .filter_map(|entry| entry.get("hooks")?.as_array())
+            .flatten()
+            .filter_map(|hook| hook.get("command")?.as_str())
+            .any(is_claude_hook_command)
+    })
 }
 
 #[cfg(test)]

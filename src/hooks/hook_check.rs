@@ -1,6 +1,8 @@
 //! Detects whether RTK hooks are installed and warns if they are outdated.
 
-use super::constants::{HOOKS_SUBDIR, PRE_TOOL_USE_KEY, REWRITE_HOOK_FILE, SETTINGS_JSON};
+use super::constants::{
+    HOOKS_SUBDIR, POST_TOOL_USE_KEY, PRE_TOOL_USE_KEY, REWRITE_HOOK_FILE, SETTINGS_JSON,
+};
 use super::init::resolve_claude_dir;
 use super::is_claude_hook_command;
 use crate::core::constants::RTK_DATA_DIR;
@@ -40,6 +42,11 @@ pub fn status() -> HookStatus {
         if old_hook.exists() {
             return HookStatus::Outdated;
         }
+        // Pre-only install (upgrader): PostToolUse output filtering missing —
+        // treat as Outdated so the once-per-day nudge suggests `rtk init -g`.
+        if !event_hook_registered(&claude_dir, POST_TOOL_USE_KEY) {
+            return HookStatus::Outdated;
+        }
         return HookStatus::Ok;
     }
 
@@ -58,7 +65,13 @@ pub fn status() -> HookStatus {
 }
 
 /// Check if the native binary command is registered in settings.json
+/// under the PreToolUse event (the rewrite hook).
 fn binary_hook_registered(claude_dir: &std::path::Path) -> bool {
+    event_hook_registered(claude_dir, PRE_TOOL_USE_KEY)
+}
+
+/// Check if the native binary command is registered under the given event key.
+fn event_hook_registered(claude_dir: &std::path::Path, event_key: &str) -> bool {
     let settings_path = claude_dir.join(SETTINGS_JSON);
     let content = match std::fs::read_to_string(&settings_path) {
         Ok(c) if !c.trim().is_empty() => c,
@@ -68,15 +81,15 @@ fn binary_hook_registered(claude_dir: &std::path::Path) -> bool {
         Ok(v) => v,
         Err(_) => return false,
     };
-    let pre_tool_use = match root
+    let event_array = match root
         .get("hooks")
-        .and_then(|h| h.get(PRE_TOOL_USE_KEY))
+        .and_then(|h| h.get(event_key))
         .and_then(|p| p.as_array())
     {
         Some(arr) => arr,
         None => return false,
     };
-    pre_tool_use
+    event_array
         .iter()
         .filter_map(|entry| entry.get("hooks")?.as_array())
         .flatten()
@@ -231,6 +244,50 @@ mod tests {
         .expect("write settings");
 
         assert!(binary_hook_registered(tmp.path()));
+    }
+
+    #[test]
+    fn test_event_hook_registered_pre_only_install() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            tmp.path().join(SETTINGS_JSON),
+            r#"{
+                "hooks": {
+                    "PreToolUse": [{
+                        "matcher": "Bash",
+                        "hooks": [{ "type": "command", "command": "rtk hook claude" }]
+                    }]
+                }
+            }"#,
+        )
+        .expect("write settings");
+
+        assert!(binary_hook_registered(tmp.path()));
+        assert!(!event_hook_registered(tmp.path(), POST_TOOL_USE_KEY));
+    }
+
+    #[test]
+    fn test_event_hook_registered_both_events() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            tmp.path().join(SETTINGS_JSON),
+            r#"{
+                "hooks": {
+                    "PreToolUse": [{
+                        "matcher": "Bash",
+                        "hooks": [{ "type": "command", "command": "rtk hook claude" }]
+                    }],
+                    "PostToolUse": [{
+                        "matcher": "Read|Grep|Glob|WebFetch|WebSearch",
+                        "hooks": [{ "type": "command", "command": "rtk hook claude" }]
+                    }]
+                }
+            }"#,
+        )
+        .expect("write settings");
+
+        assert!(binary_hook_registered(tmp.path()));
+        assert!(event_hook_registered(tmp.path(), POST_TOOL_USE_KEY));
     }
 
     #[test]
