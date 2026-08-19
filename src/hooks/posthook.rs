@@ -34,8 +34,9 @@ const MIN_POSTHOOK_SIZE: usize = 512;
 /// output was format-converted (content no longer textually identical to the
 /// on-disk file).
 const READ_CONVERSION_NOTE: &str = "RTK compressed this Read output (format conversion, \
-     e.g. json->toon, lockfile summary). The on-disk file is unchanged; re-read with rtk \
-     disabled or check the recall file before constructing Edit old_string values.";
+     e.g. json->toon, lockfile summary). The on-disk file is unchanged; before constructing \
+     Edit old_string values, re-read the exact line range with offset/limit (ranged reads \
+     pass through raw) or check the recall file.";
 
 /// Entry point: never panics, never errors, emits at most one stdout line.
 pub fn run(event: &Value) {
@@ -314,6 +315,30 @@ fn tool_enabled(config: &PosthookConfig, tool_name: &str) -> bool {
 static RTK_IN_COMMAND: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?:^|[|&;(\s])rtk\s").expect("valid regex"));
 
+/// Kill-switch prefixes need lexical detection: `RTK_POSTHOOK=0 cmd` puts the
+/// variable in the CHILD's environment — the hook process never inherits it
+/// (live-validated). Same approach as the rewrite registry's lexical
+/// `RTK_DISABLED` handling. Only leading VAR=VAL assignments are scanned.
+fn command_disables_posthook(command: &str) -> bool {
+    for token in command.split_whitespace() {
+        match token {
+            "RTK_POSTHOOK=0" | "RTK_DISABLED=1" => return true,
+            t if t.contains('=') && !t.starts_with('=') => continue,
+            _ => return false,
+        }
+    }
+    false
+}
+
+/// First token after any leading VAR=VAL assignments — the actual program
+/// name, for slugs and tracking rows.
+fn first_program_word(command: &str) -> &str {
+    command
+        .split_whitespace()
+        .find(|t| !t.contains('=') || t.starts_with('='))
+        .unwrap_or("")
+}
+
 /// Generic floor for Bash commands not rewritten by RTK: objective
 /// byte-level transforms only (ansi, progress, dedup, base64-elide, cap).
 fn process_bash(event: &Value, config: &Config, duration_ms: u64) -> Option<String> {
@@ -335,6 +360,9 @@ fn process_bash(event: &Value, config: &Config, duration_ms: u64) -> Option<Stri
         .and_then(|c| c.as_str())
         .unwrap_or("");
     if RTK_IN_COMMAND.is_match(command) {
+        return None;
+    }
+    if command_disables_posthook(command) {
         return None;
     }
     // Recall-recovery gate: a command reading the recall store must see the
@@ -363,7 +391,7 @@ fn process_bash(event: &Value, config: &Config, duration_ms: u64) -> Option<Stri
         return None;
     }
 
-    let first_word = command.split_whitespace().next().unwrap_or("");
+    let first_word = first_program_word(command);
     let ctx = LayerCtx {
         format: ContentFormat::Term,
         lang: Language::Unknown,
@@ -464,9 +492,24 @@ fn extract(
     match tool_name {
         "Read" => {
             let content = event.pointer("/tool_response/file/content")?.as_str()?;
+            let file = event.pointer("/tool_response/file")?;
+            // Partial reads (offset/limit, or host-side token-cap truncation)
+            // must never be converted: a lockfile summary of a partial file
+            // would present wrong counts as truth (live-validated), and raw
+            // ranged reads are the documented path for building Edit anchors.
+            let start_line = file.get("startLine").and_then(|v| v.as_u64()).unwrap_or(1);
+            let num_lines = file.get("numLines").and_then(|v| v.as_u64()).unwrap_or(0);
+            let total_lines = file
+                .get("totalLines")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(num_lines);
+            let partial = start_line > 1 || num_lines < total_lines;
+
             // Lockfile check first: package-lock.json would otherwise
             // classify as plain json by extension.
-            let format = if is_lockfile_name(&basename_of(source)) {
+            let format = if partial {
+                None
+            } else if is_lockfile_name(&basename_of(source)) {
                 Some(ContentFormat::Lockfile)
             } else if extension_of(source) == "json" {
                 Some(ContentFormat::Json)
@@ -999,6 +1042,56 @@ mod tests {
             .unwrap();
         assert!(!stderr.contains('\x1b'));
         assert!(stderr.contains("[x10]"));
+    }
+
+    #[test]
+    fn test_bash_env_prefix_kill_switch() {
+        let mut event = bash_fixture("repetitive");
+        event["tool_input"]["command"] = json!("RTK_POSTHOOK=0 python3 -c \"print('x')\"");
+        assert!(process_with_config(&event, &test_config()).is_none());
+
+        event["tool_input"]["command"] = json!("RTK_DISABLED=1 python3 -c \"print('x')\"");
+        assert!(process_with_config(&event, &test_config()).is_none());
+
+        event["tool_input"]["command"] = json!("FOO=bar python3 -c \"print('x')\"");
+        assert!(
+            process_with_config(&event, &test_config()).is_some(),
+            "unrelated env assignment must not disable filtering"
+        );
+
+        event["tool_input"]["command"] = json!("echo RTK_POSTHOOK=0");
+        assert!(
+            process_with_config(&event, &test_config()).is_some(),
+            "non-leading mention is not a kill switch"
+        );
+    }
+
+    #[test]
+    fn test_first_program_word_skips_assignments() {
+        assert_eq!(
+            first_program_word("RTK_POSTHOOK=0 python3 -c 'x'"),
+            "python3"
+        );
+        assert_eq!(first_program_word("FOO=1 BAR=2 make all"), "make");
+        assert_eq!(first_program_word("git status"), "git");
+        assert_eq!(first_program_word(""), "");
+    }
+
+    #[test]
+    fn test_read_partial_never_converted() {
+        let mut event = fixture("read_flat");
+        event["tool_response"]["file"]["numLines"] = json!(500);
+        assert!(
+            process_with_config(&event, &test_config()).is_none(),
+            "host-truncated read (numLines < totalLines) must pass through"
+        );
+
+        let mut event = fixture("read_flat");
+        event["tool_response"]["file"]["startLine"] = json!(10);
+        assert!(
+            process_with_config(&event, &test_config()).is_none(),
+            "ranged read (offset) must pass through"
+        );
     }
 
     #[test]
