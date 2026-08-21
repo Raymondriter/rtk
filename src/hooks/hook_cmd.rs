@@ -513,8 +513,14 @@ pub fn run_claude() -> Result<()> {
             super::posthook::run(&v);
             return Ok(());
         }
-        // PreToolUse, or absent (older hosts / test payloads): rewrite flow.
-        Some(PRE_TOOL_USE_KEY) | None => {}
+        // PreToolUse, or absent (older hosts / test payloads): rewrite flow,
+        // except Edit events which go to the JSON lens.
+        Some(PRE_TOOL_USE_KEY) | None => {
+            if v.get("tool_name").and_then(|t| t.as_str()) == Some("Edit") {
+                super::edit_lens::run(&v);
+                return Ok(());
+            }
+        }
         // Unknown event registered against this command: emit nothing.
         Some(_) => return Ok(()),
     }

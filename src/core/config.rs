@@ -160,6 +160,8 @@ pub struct PosthookConfig {
     /// Per-format converter selection: what the content is.
     /// Part 1 accepted values: "auto" | "off" (unknown strings = "auto").
     pub formats: PosthookFormats,
+    /// Translate edits made against compressed JSON views back to raw bytes.
+    pub lens: bool,
 }
 
 impl Default for PosthookConfig {
@@ -169,6 +171,7 @@ impl Default for PosthookConfig {
             tools: PosthookTools::default(),
             exclude_paths: Vec::new(),
             formats: PosthookFormats::default(),
+            lens: true,
         }
     }
 }
@@ -376,6 +379,7 @@ history_days = 90
         assert!(!config.posthook.tools.glob);
         assert!(config.posthook.exclude_paths.is_empty());
         assert!(config.posthook.tools.bash);
+        assert!(config.posthook.lens);
         assert_eq!(config.posthook.formats.json, "auto");
         assert_eq!(config.posthook.formats.web, "auto");
         assert_eq!(config.posthook.formats.lockfile, "auto");

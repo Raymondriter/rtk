@@ -1017,8 +1017,14 @@ fn patch_settings_json_command(
         .copied()
         .filter(|(event_key, _)| !hook_already_present(&root, event_key, hook_command))
         .collect();
-    let matcher_stale = missing.iter().all(|(k, _)| *k != POST_TOOL_USE_KEY)
-        && refresh_hook_matcher(&mut root, POST_TOOL_USE_KEY, CLAUDE_POST_MATCHER);
+    let mut matcher_stale = false;
+    for (event_key, matcher) in events {
+        if missing.iter().all(|(k, _)| *k != event_key)
+            && refresh_hook_matcher(&mut root, event_key, matcher)
+        {
+            matcher_stale = true;
+        }
+    }
     if missing.is_empty() && !matcher_stale {
         if verbose > 0 {
             eprintln!("settings.json: hook already present");
@@ -1070,7 +1076,7 @@ fn patch_settings_json_command(
         }
         if matcher_stale {
             println!(
-                "[dry-run] would update {POST_TOOL_USE_KEY} matcher to \"{CLAUDE_POST_MATCHER}\": {}",
+                "[dry-run] would refresh hook matchers (\"{CLAUDE_PRE_MATCHER}\" / \"{CLAUDE_POST_MATCHER}\"): {}",
                 settings_path.display()
             );
         }

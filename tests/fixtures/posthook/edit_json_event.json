@@ -1,0 +1,16 @@
+{
+  "session_id": "30b92a8a-b8ff-4b55-b52f-6e40d9d9a84c",
+  "transcript_path": "/home/user/.claude/projects/-tmp-claude-1000--mnt-c-Users-adrie-WORKSPACES-RTK-AI-LABS-rtk-cddc5cf7-f791-40fa-a281-23010b5a36e7-scratchpad-p0-proj/30b92a8a-b8ff-4b55-b52f-6e40d9d9a84c.jsonl",
+  "cwd": "/home/user/project",
+  "prompt_id": "5d318280-f38e-4fb2-a355-21cade1150ad",
+  "permission_mode": "default",
+  "hook_event_name": "PreToolUse",
+  "tool_name": "Edit",
+  "tool_input": {
+    "file_path": "/home/user/project/cfg.json",
+    "old_string": "  \"port\": 8080",
+    "new_string": "  \"port\": 9090",
+    "replace_all": false
+  },
+  "tool_use_id": "toolu_01HPLTJEZwioinRoPoCMmfwW"
+}

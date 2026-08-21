@@ -1,6 +1,8 @@
 //! Hook installation and lifecycle management for AI coding agents.
 
 pub mod constants;
+#[deny(clippy::print_stdout, clippy::print_stderr)]
+pub mod edit_lens;
 pub mod hook_audit_cmd;
 pub mod hook_check;
 #[deny(clippy::print_stdout, clippy::print_stderr)]

@@ -306,6 +306,76 @@ pub fn posthook_tee_hint(config: &Config, raw: &str, command_slug: &str) -> Opti
     Some(format_hint(&path))
 }
 
+/// Re-read rail index: path → epoch seconds of the last converted Read.
+const POSTHOOK_READS_INDEX: &str = "reads.json";
+/// Entries older than this are pruned on write.
+const POSTHOOK_READS_MAX_AGE_SECS: u64 = 3600;
+
+fn reads_index_path(config: &Config) -> Option<PathBuf> {
+    if std::env::var("RTK_TEE").ok().as_deref() == Some("0") || !config.tee.enabled {
+        return None;
+    }
+    Some(
+        get_tee_dir(config)?
+            .join(POSTHOOK_SUBDIR)
+            .join(POSTHOOK_READS_INDEX),
+    )
+}
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn load_reads_index(path: &std::path::Path) -> std::collections::BTreeMap<String, u64> {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|c| serde_json::from_str(&c).ok())
+        .unwrap_or_default()
+}
+
+/// True when `source` was served as a converted view within `window_secs`:
+/// the model's natural re-read must reach raw bytes.
+pub fn posthook_recently_read(config: &Config, source: &str, window_secs: u64) -> bool {
+    let Some(path) = reads_index_path(config) else {
+        return false;
+    };
+    load_reads_index(&path)
+        .get(source)
+        .is_some_and(|ts| now_secs().saturating_sub(*ts) < window_secs)
+}
+
+/// Record that `source` was just served as a converted view.
+pub fn posthook_mark_read(config: &Config, source: &str) {
+    let Some(path) = reads_index_path(config) else {
+        return;
+    };
+    if let Some(dir) = path.parent() {
+        if create_tee_dir(dir).is_none() {
+            return;
+        }
+    }
+    let now = now_secs();
+    let mut index = load_reads_index(&path);
+    index.retain(|_, ts| now.saturating_sub(*ts) < POSTHOOK_READS_MAX_AGE_SECS);
+    index.insert(source.to_string(), now);
+    if let Ok(serialized) = serde_json::to_string(&index) {
+        let _ = crate::core::utils::open_private(
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true),
+            &path,
+        )
+        .and_then(|mut f| {
+            use std::io::Write;
+            f.write_all(serialized.as_bytes())
+        });
+    }
+}
+
 /// Resolved posthook recall directory (for the recall-recovery gate: a
 /// command reading these files must not be post-filtered again).
 pub fn posthook_recall_dir(config: &Config) -> Option<PathBuf> {
@@ -426,6 +496,22 @@ mod tests {
             .filter(|e| e.path().extension().is_some_and(|x| x == "log"))
             .count();
         assert_eq!(count, 20, "rotation budget is 20 files");
+    }
+
+    #[test]
+    fn test_posthook_reads_index_marks_and_expires() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut config = Config::default();
+        config.tee.directory = Some(tmp.path().to_path_buf());
+
+        assert!(!posthook_recently_read(&config, "/p/a.json", 120));
+        posthook_mark_read(&config, "/p/a.json");
+        assert!(posthook_recently_read(&config, "/p/a.json", 120));
+        assert!(!posthook_recently_read(&config, "/p/other.json", 120));
+        assert!(!posthook_recently_read(&config, "/p/a.json", 0));
+
+        config.tee.enabled = false;
+        assert!(!posthook_recently_read(&config, "/p/a.json", 120));
     }
 
     #[test]

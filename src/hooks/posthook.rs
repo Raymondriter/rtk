@@ -19,6 +19,7 @@ use super::constants::POST_TOOL_USE_KEY;
 use crate::core::config::{Config, PosthookConfig};
 use crate::core::filter::Language;
 use crate::core::layers::{self, ContentFormat, LayerCtx};
+use crate::core::lens::mirror as lens_mirror;
 use crate::core::tee;
 use crate::core::tracking::{estimate_tokens, Tracker};
 use crate::core::utils::glob_match;
@@ -30,13 +31,9 @@ use std::sync::LazyLock;
 /// Raw content below this is not worth the write/track overhead.
 const MIN_POSTHOOK_SIZE: usize = 512;
 
-/// Read→Edit fidelity guard, emitted as `additionalContext` whenever a Read
-/// output was format-converted (content no longer textually identical to the
-/// on-disk file).
-const READ_CONVERSION_NOTE: &str = "RTK compressed this Read output (format conversion, \
-     e.g. json->toon, lockfile summary). The on-disk file is unchanged; before constructing \
-     Edit old_string values, re-read the exact line range with offset/limit (ranged reads \
-     pass through raw) or check the recall file.";
+/// Second converted Read of the same path inside this window is served raw:
+/// the model's natural "read it again" always reaches ground truth.
+const LENS_REREAD_WINDOW_SECS: u64 = 120;
 
 /// Entry point: never panics, never errors, emits at most one stdout line.
 pub fn run(event: &Value) {
@@ -92,6 +89,9 @@ fn process_with_config(event: &Value, config: &Config) -> Option<String> {
     if tool_name == "Bash" {
         return process_bash(event, config, duration_ms);
     }
+    if matches!(tool_name, "Edit" | "Write") {
+        return process_mirror_write(event);
+    }
 
     let (raw, format) = extract(event, tool_name, &source)?;
     if raw.len() < MIN_POSTHOOK_SIZE {
@@ -110,15 +110,28 @@ fn process_with_config(event: &Value, config: &Config) -> Option<String> {
         FormatSetting::Auto => {}
     }
 
+    let lens_view = tool_name == "Read" && format == ContentFormat::Json;
+    if lens_view && tee::posthook_recently_read(config, &source, LENS_REREAD_WINDOW_SECS) {
+        track(
+            tool_name,
+            format_token(format),
+            &source,
+            &raw,
+            &raw,
+            duration_ms,
+        );
+        return None;
+    }
+
     let composed = filter_and_compose(config, tool_name, &source, &raw, format, duration_ms)?;
 
-    let (updated, converted) = rebuild(event, tool_name, &composed)?;
-    let mut hook_output = json!({
+    let updated = rebuild(event, tool_name, &composed)?;
+    let hook_output = json!({
         "hookEventName": POST_TOOL_USE_KEY,
         "updatedToolOutput": updated,
     });
-    if converted {
-        hook_output["additionalContext"] = json!(READ_CONVERSION_NOTE);
+    if lens_view {
+        tee::posthook_mark_read(config, &source);
     }
 
     track(
@@ -163,11 +176,15 @@ fn filter_and_compose(
         return None;
     }
 
-    // Ordering invariant (emit_guarded pattern): compose filtered + hint
-    // FIRST, then guard — the hint can never push output above raw.
+    // A lens view is lossless: nothing lives "elsewhere", so announcing a
+    // recall file would be both untrue and a tell that breaks the seamless
+    // view. Lossy chains keep the hint. Recovery for views is the re-read
+    // rail, which needs no words. The recall file is still written.
     let slug = format!("{}_{}", tool_name.to_lowercase(), basename_of(source));
     let hint = tee::posthook_tee_hint(config, raw, &slug);
-    let composed = match hint {
+    // Ordering invariant (emit_guarded pattern): compose filtered + hint
+    // FIRST, then guard — the hint can never push output above raw.
+    let composed = match hint.filter(|_| !is_lens_format(format)) {
         Some(h) => format!("{filtered}\n{h}"),
         None => filtered,
     };
@@ -297,6 +314,33 @@ fn process_websearch(
     )
 }
 
+/// A `.toon` mirror was just edited: regenerate its JSON source. On failure
+/// the source is left untouched and the decode error goes back to the agent,
+/// which is the only channel that tells it the edit did not land.
+fn process_mirror_write(event: &Value) -> Option<String> {
+    let path = event.pointer("/tool_input/file_path")?.as_str()?;
+    let mirror = std::path::Path::new(path);
+    if mirror.extension().and_then(|e| e.to_str()) != Some(lens_mirror::MIRROR_EXT) {
+        return None;
+    }
+    match lens_mirror::compile(mirror) {
+        Ok(_) => None,
+        Err(e) => Some(
+            json!({
+                "hookSpecificOutput": {
+                    "hookEventName": POST_TOOL_USE_KEY,
+                    "additionalContext": format!(
+                        "The TOON mirror {} did not compile, so {} was NOT updated: {e:#}",
+                        mirror.display(),
+                        lens_mirror::source_path(mirror).display()
+                    ),
+                }
+            })
+            .to_string(),
+        ),
+    }
+}
+
 fn tool_enabled(config: &PosthookConfig, tool_name: &str) -> bool {
     match tool_name {
         "Read" => config.tools.read,
@@ -305,6 +349,9 @@ fn tool_enabled(config: &PosthookConfig, tool_name: &str) -> bool {
         "WebFetch" => config.tools.webfetch,
         "WebSearch" => config.tools.websearch,
         "Bash" => config.tools.bash,
+        // Mirror compilation is not a view filter: it must run whenever a
+        // `.toon` file is written, independent of the view toggles.
+        "Edit" | "Write" => true,
         _ => false,
     }
 }
@@ -576,6 +623,11 @@ fn format_setting(config: &PosthookConfig, format: ContentFormat) -> FormatSetti
     }
 }
 
+/// Formats whose view is a lossless rendering of the source (the lens).
+fn is_lens_format(format: ContentFormat) -> bool {
+    matches!(format, ContentFormat::Json)
+}
+
 fn format_token(format: ContentFormat) -> &'static str {
     match format {
         ContentFormat::Json => "json",
@@ -596,9 +648,8 @@ fn is_lockfile_name(basename: &str) -> bool {
 }
 
 /// Re-wrap the filtered text in the same output shape the tool produced.
-/// Returns `(updatedToolOutput, format_converted)`; `None` when the shape
-/// can't be reproduced confidently → emit nothing.
-fn rebuild(event: &Value, tool_name: &str, composed: &str) -> Option<(Value, bool)> {
+/// `None` when the shape can't be reproduced confidently → emit nothing.
+fn rebuild(event: &Value, tool_name: &str, composed: &str) -> Option<Value> {
     let mut response = event.get("tool_response")?.clone();
     match tool_name {
         "Read" => {
@@ -609,19 +660,18 @@ fn rebuild(event: &Value, tool_name: &str, composed: &str) -> Option<(Value, boo
             let lines = composed.lines().count();
             file.insert("numLines".into(), json!(lines));
             file.insert("totalLines".into(), json!(lines));
-            // Converted content can no longer anchor Edit.old_string.
-            Some((response, true))
+            Some(response)
         }
         "Grep" => {
             let obj = response.as_object_mut()?;
             obj.insert("content".into(), json!(composed));
             obj.insert("numLines".into(), json!(composed.lines().count()));
-            Some((response, false))
+            Some(response)
         }
         "WebFetch" => {
             let obj = response.as_object_mut()?;
             obj.insert("result".into(), json!(composed));
-            Some((response, false))
+            Some(response)
         }
         _ => None,
     }
@@ -712,7 +762,7 @@ mod tests {
     }
 
     #[test]
-    fn test_read_json_flat_rewrites_to_toon_with_note() {
+    fn test_read_json_flat_rewrites_to_toon() {
         let out = run_fixture("read_flat").expect("flat json must be rewritten");
         let hook = &out["hookSpecificOutput"];
         assert_eq!(hook["hookEventName"], "PostToolUse");
@@ -733,12 +783,10 @@ mod tests {
             content.lines().count()
         );
         assert_eq!(hook["updatedToolOutput"]["type"], "text");
-
-        // Read→Edit fidelity guard on conversion.
-        assert!(hook["additionalContext"]
-            .as_str()
-            .unwrap()
-            .contains("Edit old_string"));
+        assert!(
+            hook.get("additionalContext").is_none(),
+            "lens system: no per-event note"
+        );
     }
 
     #[test]
@@ -919,7 +967,7 @@ mod tests {
     }
 
     #[test]
-    fn test_read_cargo_lock_summarized_with_note() {
+    fn test_read_cargo_lock_summarized() {
         let content = include_str!("../../Cargo.lock");
         let event = serde_json::json!({
             "tool_name": "Read",
@@ -941,10 +989,7 @@ mod tests {
             .unwrap();
         assert!(new_content.starts_with("Cargo.lock: "), "summary header");
         assert!(new_content.contains("serde@"));
-        assert!(
-            hook["additionalContext"].as_str().is_some(),
-            "Read conversion note"
-        );
+        assert!(hook.get("additionalContext").is_none());
     }
 
     fn bash_fixture(name: &str) -> Value {
@@ -1078,6 +1123,68 @@ mod tests {
     }
 
     #[test]
+    fn test_lens_view_carries_no_recall_hint() {
+        let tee_dir = tempfile::tempdir().expect("tempdir");
+        let mut config = Config::default();
+        config.tee.directory = Some(tee_dir.path().to_path_buf());
+
+        let out = process_with_config(&fixture("read_flat"), &config).expect("converts");
+        let v: Value = serde_json::from_str(&out).expect("valid JSON");
+        let content = v["hookSpecificOutput"]["updatedToolOutput"]["file"]["content"]
+            .as_str()
+            .unwrap();
+        assert!(
+            !content.contains("full output:"),
+            "a lossless view must not announce a recall file: {}",
+            &content[content.len().saturating_sub(120)..]
+        );
+        // The recall file is still written, just not advertised.
+        let stored = std::fs::read_dir(tee_dir.path().join(tee::POSTHOOK_SUBDIR))
+            .expect("recall dir")
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().is_some_and(|x| x == "log"))
+            .count();
+        assert_eq!(stored, 1, "raw bytes preserved on disk");
+    }
+
+    #[test]
+    fn test_lossy_chain_keeps_recall_hint() {
+        let tee_dir = tempfile::tempdir().expect("tempdir");
+        let mut config = Config::default();
+        config.tee.directory = Some(tee_dir.path().to_path_buf());
+
+        let out = process_with_config(&bash_fixture("repetitive"), &config).expect("converts");
+        let v: Value = serde_json::from_str(&out).expect("valid JSON");
+        let stdout = v["hookSpecificOutput"]["updatedToolOutput"]["stdout"]
+            .as_str()
+            .unwrap();
+        assert!(
+            stdout.contains("full output:"),
+            "dedup/cap drop lines: hint required"
+        );
+    }
+
+    #[test]
+    fn test_reread_within_window_serves_raw() {
+        let tee_dir = tempfile::tempdir().expect("tempdir");
+        let mut config = Config::default();
+        config.tee.directory = Some(tee_dir.path().to_path_buf());
+
+        assert!(
+            process_with_config(&fixture("read_flat"), &config).is_some(),
+            "first read converts"
+        );
+        assert!(
+            process_with_config(&fixture("read_flat"), &config).is_none(),
+            "second read within the window passes through raw"
+        );
+        assert!(
+            process_with_config(&fixture("read_nested"), &config).is_some(),
+            "other paths unaffected"
+        );
+    }
+
+    #[test]
     fn test_read_partial_never_converted() {
         let mut event = fixture("read_flat");
         event["tool_response"]["file"]["numLines"] = json!(500);
@@ -1092,6 +1199,77 @@ mod tests {
             process_with_config(&event, &test_config()).is_none(),
             "ranged read (offset) must pass through"
         );
+    }
+
+    #[test]
+    fn test_toon_mirror_edit_compiles_source() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let json = dir.path().join("data.json");
+        let raw = "[\n  {\n    \"id\": 1,\n    \"name\": \"a\"\n  },\n  {\n    \"id\": 2,\n    \"name\": \"b\"\n  }\n]\n";
+        std::fs::write(&json, raw).expect("write");
+        let mirror = crate::core::lens::mirror::extract(&json)
+            .expect("extract")
+            .path;
+
+        // Agent edits the mirror; the hook must regenerate the JSON source.
+        let toon = std::fs::read_to_string(&mirror).expect("read");
+        std::fs::write(&mirror, toon.replace("1,a", "1,renamed")).expect("write");
+
+        let event = serde_json::json!({
+            "tool_name": "Edit",
+            "tool_input": {"file_path": mirror.to_string_lossy()},
+            "tool_response": {"filePath": mirror.to_string_lossy(), "success": true}
+        });
+        assert!(
+            process_with_config(&event, &test_config()).is_none(),
+            "a successful compile is silent"
+        );
+        let value: Value =
+            serde_json::from_str(&std::fs::read_to_string(&json).expect("read")).expect("json");
+        assert_eq!(value[0]["name"], "renamed");
+        assert_eq!(value[1]["name"], "b");
+    }
+
+    #[test]
+    fn test_toon_mirror_bad_edit_reports_and_keeps_source() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let json = dir.path().join("data.json");
+        let raw = "[\n  {\n    \"id\": 1,\n    \"name\": \"a\"\n  },\n  {\n    \"id\": 2,\n    \"name\": \"b\"\n  }\n]\n";
+        std::fs::write(&json, raw).expect("write");
+        let mirror = crate::core::lens::mirror::extract(&json)
+            .expect("extract")
+            .path;
+
+        // Stale row count: strict decode rejects it.
+        let toon = std::fs::read_to_string(&mirror).expect("read");
+        std::fs::write(&mirror, toon.replace("[2]", "[9]")).expect("write");
+
+        let event = serde_json::json!({
+            "tool_name": "Write",
+            "tool_input": {"file_path": mirror.to_string_lossy()},
+            "tool_response": {"filePath": mirror.to_string_lossy(), "success": true}
+        });
+        let out = process_with_config(&event, &test_config()).expect("reports the failure");
+        let v: Value = serde_json::from_str(&out).expect("valid JSON");
+        let note = v["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap();
+        assert!(note.contains("did not compile"), "agent is told: {note}");
+        assert_eq!(
+            std::fs::read_to_string(&json).expect("read"),
+            raw,
+            "source untouched"
+        );
+    }
+
+    #[test]
+    fn test_non_mirror_edit_ignored() {
+        let event = serde_json::json!({
+            "tool_name": "Edit",
+            "tool_input": {"file_path": "/tmp/whatever.rs"},
+            "tool_response": {"filePath": "/tmp/whatever.rs", "success": true}
+        });
+        assert!(process_with_config(&event, &test_config()).is_none());
     }
 
     #[test]

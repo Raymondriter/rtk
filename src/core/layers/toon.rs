@@ -1,11 +1,12 @@
-//! `toon` layer: shape-gated TOON encoding for JSON content.
+//! `toon` layer: lens-governed compressed view of JSON content.
 //!
-//! Measured reality: TOON wins (−40/−60%) on uniform arrays of flat objects
-//! but loses to minified JSON on nested/non-uniform data. The shape gate is
-//! therefore mandatory: gate → encode → compare vs minified → keep the
-//! smaller. Parse failure → passthrough.
+//! Renders TOON and minified JSON with the shared lens options, keeps the
+//! smaller one, and serves it only if it round-trips back to the source
+//! value (the lens admissibility law — every view shown must be one the
+//! lens can translate edits against). Parse failure → passthrough.
 
 use super::{Layer, LayerCtx, LayerOutcome};
+use crate::core::lens::options::best_view;
 use serde_json::Value;
 
 pub struct ToonLayer;
@@ -19,46 +20,13 @@ impl Layer for ToonLayer {
         let Ok(value) = serde_json::from_str::<Value>(input) else {
             return LayerOutcome::Continue(input.to_string());
         };
-        let Ok(minified) = serde_json::to_string(&value) else {
-            return LayerOutcome::Continue(input.to_string());
-        };
-
-        // ShortCircuit on conversion: encoded/minified output is data the
-        // model may need whole — a downstream truncate line-cap would chop a
-        // minified one-liner to 500 chars and silently destroy it.
-        if is_uniform_flat_array(&value) {
-            if let Ok(toon) = toon_format::encode_default(&value) {
-                if toon.len() < minified.len() {
-                    return LayerOutcome::ShortCircuit(toon);
-                }
-            }
+        match best_view(&value) {
+            // ShortCircuit: encoded output is data the model may need whole —
+            // nothing downstream may reshape it.
+            Some((view, _)) => LayerOutcome::ShortCircuit(view),
+            None => LayerOutcome::Continue(input.to_string()),
         }
-        LayerOutcome::ShortCircuit(minified)
     }
-}
-
-/// TOON's winning shape: an array (≥2 items) of objects sharing one flat
-/// key set (scalar values only).
-fn is_uniform_flat_array(value: &Value) -> bool {
-    let Value::Array(items) = value else {
-        return false;
-    };
-    if items.len() < 2 {
-        return false;
-    }
-    let Some(Value::Object(first)) = items.first() else {
-        return false;
-    };
-    let keys: Vec<&String> = first.keys().collect();
-
-    items.iter().all(|item| match item {
-        Value::Object(obj) => {
-            obj.len() == keys.len()
-                && obj.keys().zip(keys.iter()).all(|(a, b)| a == *b)
-                && obj.values().all(|v| !v.is_array() && !v.is_object())
-        }
-        _ => false,
-    })
 }
 
 #[cfg(test)]
@@ -66,6 +34,7 @@ mod tests {
     use super::super::{ContentFormat, LayerCtx};
     use super::*;
     use crate::core::filter::Language;
+    use crate::core::lens::options::{parse_view, values_equal};
 
     fn ctx() -> LayerCtx<'static> {
         LayerCtx {
@@ -117,29 +86,27 @@ mod tests {
     }
 
     #[test]
-    fn test_nested_json_falls_back_to_minify() {
+    fn test_nested_json_view_is_smallest_admissible() {
         let input = fixture_content(include_str!(
             "../../../tests/fixtures/posthook/read_json_nested.json"
         ));
+        let value: Value = serde_json::from_str(&input).unwrap();
         let out = apply(&input);
-        // Nested/non-uniform: TOON loses, minified JSON must win.
-        assert!(out.trim_start().starts_with('{'), "expected minified JSON");
-        let reparsed: serde_json::Value = serde_json::from_str(&out).expect("still valid JSON");
-        let original: serde_json::Value = serde_json::from_str(&input).expect("valid input");
-        assert_eq!(reparsed, original, "minify must be lossless");
+        let (expected, kind) = best_view(&value).expect("admissible view");
+        assert_eq!(out, expected);
+        let decoded = parse_view(&out, kind).expect("view decodes");
+        assert!(values_equal(&value, &decoded), "lossless");
         let savings = 100.0 - (out.len() as f64 / input.len() as f64 * 100.0);
-        assert!(
-            savings >= 20.0,
-            "nested json minify: expected ≥20% savings, got {:.1}%",
-            savings
-        );
+        assert!(savings >= 20.0, "expected ≥20% savings, got {savings:.1}%");
     }
 
     #[test]
-    fn test_non_uniform_array_falls_back_to_minify() {
+    fn test_view_never_larger_than_minified() {
         let input = r#"[{"a": 1}, {"b": {"nested": true}}]"#;
         let out = apply(input);
-        assert_eq!(out, r#"[{"a":1},{"b":{"nested":true}}]"#);
+        let value: Value = serde_json::from_str(input).unwrap();
+        let minified = serde_json::to_string(&value).unwrap();
+        assert!(out.len() <= minified.len());
     }
 
     #[test]

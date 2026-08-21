@@ -98,6 +98,11 @@ enum Commands {
     },
 
     /// Read file with intelligent filtering
+    /// TOON mirrors: compact `.toon` working copies of JSON files
+    Toon {
+        #[command(subcommand)]
+        action: ToonAction,
+    },
     Read {
         /// Files to read (supports multiple, like cat)
         #[arg(required = true, num_args = 1..)]
@@ -855,6 +860,25 @@ enum Commands {
 }
 
 #[derive(Debug, Subcommand)]
+pub enum ToonAction {
+    /// Create or refresh a `.toon` mirror from a JSON file
+    Extract {
+        #[arg(required = true, num_args = 1..)]
+        files: Vec<PathBuf>,
+    },
+    /// Regenerate the JSON source from a `.toon` mirror
+    Compile {
+        #[arg(required = true, num_args = 1..)]
+        files: Vec<PathBuf>,
+    },
+    /// Verify mirrors and sources agree (exit 1 if any drifted)
+    Check {
+        #[arg(required = true, num_args = 1..)]
+        files: Vec<PathBuf>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
 enum HookCommands {
     /// Process Claude Code PreToolUse hook (reads JSON from stdin)
     Claude,
@@ -1606,6 +1630,10 @@ fn run_cli() -> Result<i32> {
         Commands::Tree { args } => tree::run(&args, cli.verbose)?,
 
         // ISSUE #989: support multiple files (cat file1 file2 → rtk read file1 file2)
+        Commands::Toon { action } => {
+            cmds::system::toon_cmd::run(action)?;
+            0
+        }
         Commands::Read {
             files,
             level,

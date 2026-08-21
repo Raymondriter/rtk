@@ -11,12 +11,13 @@ pub const BEFORE_TOOL_KEY: &str = "BeforeTool";
 
 /// Native Rust hook command for Claude Code (replaces rtk-rewrite.sh).
 pub const CLAUDE_HOOK_COMMAND: &str = "rtk hook claude";
-/// Tool matcher for the Claude Code PreToolUse rewrite hook.
-pub const CLAUDE_PRE_MATCHER: &str = "Bash";
+/// Tool matcher for the Claude Code PreToolUse hook: Bash command rewrite +
+/// Edit translation against compressed JSON views (the lens).
+pub const CLAUDE_PRE_MATCHER: &str = "Bash|Edit";
 /// Tool matcher for the Claude Code PostToolUse output-filter hook.
 /// Bash included: generic-floor filtering for commands NOT rewritten by RTK
 /// (the runtime skips rtk-prefixed commands).
-pub const CLAUDE_POST_MATCHER: &str = "Bash|Read|Grep|Glob|WebFetch|WebSearch";
+pub const CLAUDE_POST_MATCHER: &str = "Bash|Read|Grep|Glob|WebFetch|WebSearch|Edit|Write";
 /// Native Rust hook command for Cursor (replaces rtk-rewrite.sh).
 pub const CURSOR_HOOK_COMMAND: &str = "rtk hook cursor";
 /// Native Rust hook command for Factory Droid.
