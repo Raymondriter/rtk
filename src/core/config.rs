@@ -23,6 +23,8 @@ pub struct Config {
     pub limits: LimitsConfig,
     #[serde(default)]
     pub posthook: PosthookConfig,
+    #[serde(default)]
+    pub toon: ToonConfig,
 }
 
 #[derive(Debug, Serialize, Deserialize, Default)]
@@ -221,6 +223,33 @@ impl Default for PosthookFormats {
     }
 }
 
+/// Session-scoped TOON mirrors (`[toon]` in config.toml).
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ToonConfig {
+    /// Serve `.toon` working copies for JSON reads during a session.
+    pub mirrors: bool,
+    /// Files smaller than this are not worth a mirror.
+    pub min_bytes: usize,
+    /// Basenames that never get a mirror (hand-edited or tool-owned files).
+    pub exclude: Vec<String>,
+}
+
+impl Default for ToonConfig {
+    fn default() -> Self {
+        Self {
+            mirrors: true,
+            min_bytes: 2048,
+            exclude: vec![
+                "package.json".into(),
+                "package-lock.json".into(),
+                "tsconfig.json".into(),
+                "composer.json".into(),
+            ],
+        }
+    }
+}
+
 /// Get posthook config. Falls back to defaults if config can't be loaded.
 pub fn posthook() -> PosthookConfig {
     Config::load().map(|c| c.posthook).unwrap_or_default()
@@ -360,6 +389,26 @@ enabled = true
         let config = Config::default();
         assert!(!config.telemetry.enabled);
         assert!(config.telemetry.consent_given.is_none());
+    }
+
+    #[test]
+    fn test_toon_defaults() {
+        let config = Config::default();
+        assert!(config.toon.mirrors);
+        assert_eq!(config.toon.min_bytes, 2048);
+        assert!(config.toon.exclude.iter().any(|e| e == "package.json"));
+    }
+
+    #[test]
+    fn test_toon_section_parses() {
+        let toml = "[toon]\nmirrors = false\nmin_bytes = 512\n";
+        let config: Config = toml::from_str(toml).expect("valid toml");
+        assert!(!config.toon.mirrors);
+        assert_eq!(config.toon.min_bytes, 512);
+        assert!(
+            !config.toon.exclude.is_empty(),
+            "missing field keeps default"
+        );
     }
 
     #[test]

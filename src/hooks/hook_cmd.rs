@@ -515,12 +515,21 @@ pub fn run_claude() -> Result<()> {
         }
         // PreToolUse, or absent (older hosts / test payloads): rewrite flow,
         // except Edit events which go to the JSON lens.
-        Some(PRE_TOOL_USE_KEY) | None => {
-            if v.get("tool_name").and_then(|t| t.as_str()) == Some("Edit") {
+        Some(super::constants::SESSION_END_KEY) => {
+            super::toon_hook::run_session_end(&v);
+            return Ok(());
+        }
+        Some(PRE_TOOL_USE_KEY) | None => match v.get("tool_name").and_then(|t| t.as_str()) {
+            Some("Edit") => {
                 super::edit_lens::run(&v);
                 return Ok(());
             }
-        }
+            Some("Read") => {
+                super::toon_hook::run_pre_read(&v);
+                return Ok(());
+            }
+            _ => {}
+        },
         // Unknown event registered against this command: emit nothing.
         Some(_) => return Ok(()),
     }

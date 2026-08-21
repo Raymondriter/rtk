@@ -19,7 +19,6 @@ use super::constants::POST_TOOL_USE_KEY;
 use crate::core::config::{Config, PosthookConfig};
 use crate::core::filter::Language;
 use crate::core::layers::{self, ContentFormat, LayerCtx};
-use crate::core::lens::mirror as lens_mirror;
 use crate::core::tee;
 use crate::core::tracking::{estimate_tokens, Tracker};
 use crate::core::utils::glob_match;
@@ -90,7 +89,7 @@ fn process_with_config(event: &Value, config: &Config) -> Option<String> {
         return process_bash(event, config, duration_ms);
     }
     if matches!(tool_name, "Edit" | "Write") {
-        return process_mirror_write(event);
+        return super::toon_hook::post_write(event);
     }
 
     let (raw, format) = extract(event, tool_name, &source)?;
@@ -312,33 +311,6 @@ fn process_websearch(
         })
         .to_string(),
     )
-}
-
-/// A `.toon` mirror was just edited: regenerate its JSON source. On failure
-/// the source is left untouched and the decode error goes back to the agent,
-/// which is the only channel that tells it the edit did not land.
-fn process_mirror_write(event: &Value) -> Option<String> {
-    let path = event.pointer("/tool_input/file_path")?.as_str()?;
-    let mirror = std::path::Path::new(path);
-    if mirror.extension().and_then(|e| e.to_str()) != Some(lens_mirror::MIRROR_EXT) {
-        return None;
-    }
-    match lens_mirror::compile(mirror) {
-        Ok(_) => None,
-        Err(e) => Some(
-            json!({
-                "hookSpecificOutput": {
-                    "hookEventName": POST_TOOL_USE_KEY,
-                    "additionalContext": format!(
-                        "The TOON mirror {} did not compile, so {} was NOT updated: {e:#}",
-                        mirror.display(),
-                        lens_mirror::source_path(mirror).display()
-                    ),
-                }
-            })
-            .to_string(),
-        ),
-    }
 }
 
 fn tool_enabled(config: &PosthookConfig, tool_name: &str) -> bool {

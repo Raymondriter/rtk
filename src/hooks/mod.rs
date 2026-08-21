@@ -13,6 +13,8 @@ pub mod permissions;
 #[deny(clippy::print_stdout, clippy::print_stderr)]
 pub mod posthook;
 pub mod rewrite_cmd;
+#[deny(clippy::print_stdout, clippy::print_stderr)]
+pub mod toon_hook;
 pub mod trust;
 pub mod verify_cmd;
 
