@@ -215,7 +215,7 @@ pub struct PosthookFormats {
 impl Default for PosthookFormats {
     fn default() -> Self {
         Self {
-            json: "auto".into(),
+            json: "off".into(),
             web: "auto".into(),
             lockfile: "auto".into(),
             term: "auto".into(),
@@ -429,7 +429,10 @@ history_days = 90
         assert!(config.posthook.exclude_paths.is_empty());
         assert!(config.posthook.tools.bash);
         assert!(config.posthook.lens);
-        assert_eq!(config.posthook.formats.json, "auto");
+        assert_eq!(
+            config.posthook.formats.json, "off",
+            "a JSON view no file on disk matches breaks every anchor an agent copies from it"
+        );
         assert_eq!(config.posthook.formats.web, "auto");
         assert_eq!(config.posthook.formats.lockfile, "auto");
         assert_eq!(config.posthook.formats.term, "auto");
@@ -444,7 +447,7 @@ enabled = false
         let config: Config = toml::from_str(toml).expect("valid toml");
         assert!(!config.posthook.enabled);
         assert!(config.posthook.tools.read, "missing tools keep defaults");
-        assert_eq!(config.posthook.formats.json, "auto");
+        assert_eq!(config.posthook.formats.json, "off");
     }
 
     #[test]

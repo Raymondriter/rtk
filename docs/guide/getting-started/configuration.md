@@ -56,7 +56,7 @@ exclude_paths = []          # globs vs file_path/url, e.g. ["**/*.min.js"]
 tools = { read = true, grep = true, webfetch = true, websearch = true, glob = false, bash = true }
 
 [posthook.formats]          # per-format converter: "auto" | "off"
-json = "auto"
+json = "off"                # off by default: a converted view no file matches breaks Edit anchors
 web = "auto"
 lockfile = "auto"
 term = "auto"               # Bash generic floor
@@ -102,9 +102,11 @@ Read, Grep, WebFetch, WebSearch (Glob wired but off by default). The tool runs
 raw; a PostToolUse hook sends the result through RTK, which replaces what the
 model reads when (and only when) the filtered version is smaller:
 
-- **Read of `.json` files** — uniform arrays of flat objects are re-encoded as
-  [TOON](https://github.com/johannschopplich/toon); other JSON is minified.
-  A note is attached telling the agent the on-disk file is unchanged.
+- **Read of `.json` files** — off by default (`json = "auto"` to enable).
+  Converting a Read result gives the agent a view no file on disk matches, so
+  every `old_string` it copies from that view fails to match and the edit is
+  lost. JSON compression instead goes through session TOON mirrors
+  (`[toon] mirrors`), where the view *is* a file and anchors are real.
 - **Grep (content mode)** — matches are grouped by file (`grep-group`),
   losslessly: every match is kept.
 - **WebFetch / WebSearch** — ANSI stripping, HTML→Markdown when the response

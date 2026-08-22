@@ -709,6 +709,14 @@ mod tests {
         config
     }
 
+    /// The JSON view is opt-in: no file on disk holds the converted bytes, so
+    /// anchors copied from it match nothing.
+    fn json_view_config() -> Config {
+        let mut config = test_config();
+        config.posthook.formats.json = "auto".into();
+        config
+    }
+
     fn fixture(name: &str) -> Value {
         let raw = match name {
             "read_flat" => include_str!("../../tests/fixtures/posthook/read_json_flat.json"),
@@ -734,8 +742,18 @@ mod tests {
     }
 
     #[test]
+    fn test_json_reads_pass_through_by_default() {
+        assert!(
+            run_fixture("read_flat").is_none(),
+            "a converted view with no file behind it hands the agent anchors that match nothing"
+        );
+    }
+
+    #[test]
     fn test_read_json_flat_rewrites_to_toon() {
-        let out = run_fixture("read_flat").expect("flat json must be rewritten");
+        let raw = process_with_config(&fixture("read_flat"), &json_view_config())
+            .expect("flat json must be rewritten");
+        let out: Value = serde_json::from_str(&raw).expect("emitted output is valid JSON");
         let hook = &out["hookSpecificOutput"];
         assert_eq!(hook["hookEventName"], "PostToolUse");
 
@@ -1099,6 +1117,7 @@ mod tests {
         let tee_dir = tempfile::tempdir().expect("tempdir");
         let mut config = Config::default();
         config.tee.directory = Some(tee_dir.path().to_path_buf());
+        config.posthook.formats.json = "auto".into();
 
         let out = process_with_config(&fixture("read_flat"), &config).expect("converts");
         let v: Value = serde_json::from_str(&out).expect("valid JSON");
@@ -1141,6 +1160,7 @@ mod tests {
         let tee_dir = tempfile::tempdir().expect("tempdir");
         let mut config = Config::default();
         config.tee.directory = Some(tee_dir.path().to_path_buf());
+        config.posthook.formats.json = "auto".into();
 
         assert!(
             process_with_config(&fixture("read_flat"), &config).is_some(),
