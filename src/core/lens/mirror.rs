@@ -369,9 +369,14 @@ pub mod session {
     /// A mirror must be this much smaller than its source to be worth serving.
     const MAX_MIRROR_RATIO: f64 = 0.8;
     /// Strikes — a check we provoked, or an edit we could not compile — before
-    /// mirrors stop for the session. Bounds the worst case to a fixed cost
-    /// instead of one detour per file.
-    const MAX_STRIKES: u32 = 2;
+    /// mirrors stop for the session.
+    ///
+    /// One, because a single detour costs ~17,500 input-equivalent tokens and a
+    /// mirrored file returns ~1,400. A session would need a dozen good mirrors
+    /// to pay for one bad turn, and typical sessions touch two or three large
+    /// JSON files. Once an agent has shown it does not trust the view, the rest
+    /// of the session is not where that gets recovered.
+    const MAX_STRIKES: u32 = 1;
 
     #[derive(Debug, Default, Serialize, Deserialize)]
     struct Index {
@@ -679,11 +684,9 @@ pub mod session {
 
             assert!(ensure(&config, &json).is_some());
             strike(&config);
-            assert!(ensure(&config, &other).is_some(), "one check is affordable");
-            strike(&config);
             assert!(
-                ensure(&config, &dir.path().join("records.json")).is_none(),
-                "past the limit the session stops paying"
+                ensure(&config, &other).is_none(),
+                "one detour costs more than the rest of the session can return"
             );
         }
 
