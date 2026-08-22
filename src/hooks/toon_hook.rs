@@ -81,14 +81,16 @@ fn pre_read_with(config: &Config, event: &Value) -> Option<String> {
         "permissionDecisionReason": "RTK: TOON working copy",
         "updatedInput": updated,
     });
-    // The format and path are visible in the result itself; the only fact the
-    // model cannot infer is that edits propagate. Say that once per file.
+    // The redirect is invisible: the model asked for the JSON path, so without
+    // being told the mirror's name it addresses edits to the JSON and its TOON
+    // anchor matches nothing. Name the file to edit, once per file.
     if served.first_time {
-        let source = json
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("the JSON file");
-        hook_output["additionalContext"] = json!(format!("Editing this file updates {source}."));
+        let source = json.file_name().and_then(|n| n.to_str());
+        let mirror = served.mirror.file_name().and_then(|n| n.to_str());
+        if let (Some(source), Some(mirror)) = (source, mirror) {
+            hook_output["additionalContext"] =
+                json!(format!("Edit {mirror} (TOON view of {source})."));
+        }
     }
     Some(json!({ "hookSpecificOutput": hook_output }).to_string())
 }
@@ -180,6 +182,30 @@ mod tests {
         assert!(Path::new(served).exists(), "mirror created on demand");
         assert!(
             std::fs::metadata(served).unwrap().len() < std::fs::metadata(&json).unwrap().len() / 2
+        );
+    }
+
+    #[test]
+    fn test_note_names_the_file_to_edit() {
+        let dir = TempDir::new().expect("tempdir");
+        let json = dir.path().join("records.json");
+        std::fs::write(&json, rows(40)).expect("write");
+        let config = config_for(&dir);
+
+        let out = pre_read_with(&config, &read_event(&json)).expect("redirected");
+        let v: Value = serde_json::from_str(&out).expect("valid JSON");
+        // The model asked for the JSON path and cannot see the swap, so the
+        // note has to spell out which file its anchors belong to.
+        assert_eq!(
+            v["hookSpecificOutput"]["additionalContext"],
+            "Edit records.toon (TOON view of records.json)."
+        );
+
+        // A second read is the raw escape hatch, so the note cannot repeat
+        // here; the once-per-file flag itself is covered in mirror::session.
+        assert!(
+            pre_read_with(&config, &read_event(&json)).is_none(),
+            "second read serves raw"
         );
     }
 
