@@ -36,9 +36,14 @@ pub struct Written {
     pub byte_identical: bool,
 }
 
-/// JSON -> TOON mirror. Refuses to write a mirror that does not decode back
-/// to the same value.
+/// JSON -> TOON mirror beside the source (the `rtk toon` CLI shape).
 pub fn extract(json_path: &Path) -> Result<Written> {
+    extract_to(json_path, &mirror_path(json_path))
+}
+
+/// JSON -> TOON mirror at an explicit path. Refuses to write a mirror that
+/// does not decode back to the same value.
+pub fn extract_to(json_path: &Path, out: &Path) -> Result<Written> {
     let raw = std::fs::read_to_string(json_path)
         .with_context(|| format!("Failed to read {}", json_path.display()))?;
     let value: Value = serde_json::from_str(&raw)
@@ -56,20 +61,28 @@ pub fn extract(json_path: &Path) -> Result<Written> {
     }
 
     let regenerated = render_json(&decoded, &Style::detect(&raw), raw.ends_with('\n'))?;
-    let out = mirror_path(json_path);
-    std::fs::write(&out, &toon).with_context(|| format!("Failed to write {}", out.display()))?;
+    if let Some(dir) = out.parent() {
+        std::fs::create_dir_all(dir)
+            .with_context(|| format!("Failed to create {}", dir.display()))?;
+    }
+    std::fs::write(out, &toon).with_context(|| format!("Failed to write {}", out.display()))?;
 
     Ok(Written {
-        path: out,
+        path: out.to_path_buf(),
         from_bytes: raw.len(),
         to_bytes: toon.len(),
         byte_identical: regenerated == raw,
     })
 }
 
-/// TOON mirror -> JSON. Verifies before writing; on any doubt the existing
-/// JSON is left untouched.
+/// TOON mirror -> the JSON beside it (the `rtk toon` CLI shape).
 pub fn compile(mirror: &Path) -> Result<Written> {
+    compile_to(mirror, &source_path(mirror))
+}
+
+/// TOON mirror -> an explicit JSON path. Verifies before writing; on any doubt
+/// the existing JSON is left untouched.
+pub fn compile_to(mirror: &Path, out: &Path) -> Result<Written> {
     let toon = std::fs::read_to_string(mirror)
         .with_context(|| format!("Failed to read {}", mirror.display()))?;
     // Deleting or adding a row leaves the `[N]` header stale, and a strict
@@ -83,26 +96,17 @@ pub fn compile(mirror: &Path) -> Result<Written> {
             mirror.display()
         )
     })?;
-    // The mirror is what the next read serves, so keep it canonical: an edit
-    // that decodes but is spelled differently is rewritten, not rejected.
-    match encode_view(&value) {
-        Some(re) if re.trim_end() != toon.trim_end() => {
-            let canonical = if toon.ends_with('\n') {
-                format!("{}\n", re.trim_end())
-            } else {
-                re.trim_end().to_string()
-            };
-            std::fs::write(mirror, &canonical)
-                .with_context(|| format!("Failed to write {}", mirror.display()))?;
-        }
-        Some(_) => {}
-        None => bail!("{} could not be re-encoded", mirror.display()),
+    // Deliberately not written back. Compiling makes the source newer than the
+    // mirror, so the next read re-extracts a fresh one anyway; rewriting here
+    // only makes the host announce "hook modified this file after your edit",
+    // which invites the agent to re-read and costs a round trip.
+    if encode_view(&value).is_none() {
+        bail!("{} could not be re-encoded", mirror.display());
     }
 
     // Match the existing source's formatting so a compile produces a minimal
     // diff, including whether it ends with a newline.
-    let out = source_path(mirror);
-    let existing = std::fs::read_to_string(&out).ok();
+    let existing = std::fs::read_to_string(out).ok();
     let style = existing.as_deref().map(Style::detect).unwrap_or(Style {
         indent: Some("  ".into()),
     });
@@ -111,11 +115,10 @@ pub fn compile(mirror: &Path) -> Result<Written> {
         .map(|e| e.ends_with('\n'))
         .unwrap_or(true);
     let rendered = render_json(&value, &style, trailing_newline)?;
-    std::fs::write(&out, &rendered)
-        .with_context(|| format!("Failed to write {}", out.display()))?;
+    std::fs::write(out, &rendered).with_context(|| format!("Failed to write {}", out.display()))?;
 
     Ok(Written {
-        path: out,
+        path: out.to_path_buf(),
         from_bytes: toon.len(),
         to_bytes: rendered.len(),
         byte_identical: true,
@@ -272,13 +275,13 @@ mod tests {
         assert!(
             std::fs::read_to_string(&mirror)
                 .expect("read")
-                .starts_with("[119]"),
-            "mirror left consistent for the next edit"
+                .starts_with("[120]"),
+            "the stale header is reconciled in memory, never rewritten under the agent"
         );
     }
 
     #[test]
-    fn test_non_canonical_spelling_is_rewritten_not_rejected() {
+    fn test_non_canonical_spelling_is_accepted_not_rejected() {
         let dir = TempDir::new().expect("tempdir");
         let json = setup(&dir, &fixture());
         let mirror = extract(&json).expect("extract").path;
@@ -298,8 +301,8 @@ mod tests {
         assert_eq!(value[1]["name"], "user_1");
         assert_eq!(
             std::fs::read_to_string(&mirror).expect("read"),
-            toon,
-            "mirror restored to canonical form"
+            edited,
+            "the mirror is left exactly as the agent wrote it"
         );
     }
 
@@ -364,7 +367,13 @@ pub mod session {
     use super::*;
     use crate::core::config::{Config, ToonConfig};
     use serde::{Deserialize, Serialize};
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeMap, BTreeSet};
+
+    /// Mirrors live in a workspace-local store rather than beside the source.
+    /// Inside the project the agent still sees a project file — which is what
+    /// made it adopt the mirror at all — but nothing lands next to the JSON,
+    /// and one directory holds everything to clean up.
+    const STORE_DIR: &str = ".rtk";
 
     /// A mirror must be this much smaller than its source to be worth serving.
     const MAX_MIRROR_RATIO: f64 = 0.8;
@@ -380,8 +389,8 @@ pub mod session {
 
     #[derive(Debug, Default, Serialize, Deserialize)]
     struct Index {
-        /// Mirrors this session created.
-        mirrors: BTreeSet<String>,
+        /// Mirrors this session created, each mapped to its source.
+        mirrors: BTreeMap<String, String>,
         /// Sources that failed the mirror policy; never retried this session.
         skipped: BTreeSet<String>,
         /// Sources pinned to raw bytes for the rest of the session.
@@ -392,6 +401,46 @@ pub mod session {
         /// Mirrors that failed to compile, and how often.
         #[serde(default)]
         failures: std::collections::BTreeMap<String, u32>,
+    }
+
+    /// Where a source's mirror lives: `<project>/.rtk/<path/to/file>.toon`.
+    ///
+    /// The project is the nearest ancestor holding a `.git`, so every mirror in
+    /// a repo lands in one store; outside a repo the source's own directory
+    /// stands in. Keeping the relative path means two `services.json` in
+    /// different folders never collide, and the basename an agent sees is the
+    /// one it asked for.
+    pub fn mirror_for(json: &Path) -> PathBuf {
+        let root = project_root(json);
+        let relative = json
+            .strip_prefix(&root)
+            .unwrap_or_else(|_| Path::new(json.file_name().unwrap_or(json.as_os_str())));
+        root.join(STORE_DIR)
+            .join(relative)
+            .with_extension(MIRROR_EXT)
+    }
+
+    fn project_root(json: &Path) -> PathBuf {
+        json.ancestors()
+            .find(|dir| dir.join(".git").is_dir())
+            .map(Path::to_path_buf)
+            .or_else(|| json.parent().map(Path::to_path_buf))
+            .unwrap_or_else(|| PathBuf::from("."))
+    }
+
+    /// The store ignores itself, so nothing RTK writes can be committed and no
+    /// file of the user's is touched to arrange that.
+    fn seal_store(mirror: &Path) {
+        let Some(store) = mirror.ancestors().find(|d| d.ends_with(STORE_DIR)) else {
+            return;
+        };
+        let ignore = store.join(".gitignore");
+        if ignore.exists() {
+            return;
+        }
+        if std::fs::create_dir_all(store).is_ok() {
+            let _ = std::fs::write(ignore, "*\n");
+        }
     }
 
     pub struct Served {
@@ -453,11 +502,13 @@ pub mod session {
         {
             return None;
         }
+        let skip_key = key.clone();
 
-        let mirror = mirror_path(json);
+        let mirror = mirror_for(json);
         if !mirror.exists() || newer(json, &mirror) {
-            let Ok(written) = extract(json) else {
-                index.skipped.insert(key);
+            seal_store(&mirror);
+            let Ok(written) = extract_to(json, &mirror) else {
+                index.skipped.insert(skip_key);
                 save(config, &index);
                 return None;
             };
@@ -465,13 +516,16 @@ pub mod session {
                 || !worth_it(written.from_bytes, written.to_bytes, &config.toon)
             {
                 let _ = std::fs::remove_file(&mirror);
-                index.skipped.insert(key);
+                index.skipped.insert(skip_key);
                 save(config, &index);
                 return None;
             }
         }
 
-        let first_time = index.mirrors.insert(mirror.display().to_string());
+        let first_time = index
+            .mirrors
+            .insert(mirror.display().to_string(), key)
+            .is_none();
         if first_time {
             save(config, &index);
         }
@@ -493,6 +547,16 @@ pub mod session {
     /// Pin a source to raw bytes for the rest of the session. Used when the
     /// agent asks for a line range, re-reads, or edits the JSON directly —
     /// all signals that it is working against real bytes.
+    /// The JSON a mirror belongs to. Session mirrors are looked up in the
+    /// index; a mirror made by the `rtk toon` CLI sits beside its source.
+    pub fn source_of(config: &Config, mirror: &Path) -> PathBuf {
+        load(config)
+            .mirrors
+            .get(&mirror.display().to_string())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| source_path(mirror))
+    }
+
     /// Record something that cost a round trip. Past the limit the session
     /// stops mirroring: a bounded loss beats an open-ended one.
     pub fn strike(config: &Config) {
@@ -515,7 +579,8 @@ pub mod session {
         index.strikes = index.strikes.saturating_add(1);
         save(config, &index);
         if give_up {
-            pin_raw(config, &source_path(mirror));
+            let source = source_of(config, mirror);
+            pin_raw(config, &source);
         }
         give_up
     }
@@ -525,11 +590,12 @@ pub mod session {
         if !index.raw.insert(json.display().to_string()) {
             return;
         }
-        let mirror = mirror_path(json);
+        let mirror = mirror_for(json);
         let key = mirror.display().to_string();
         let unmergeable = index.failures.contains_key(&key);
-        if index.mirrors.remove(&key) && !unmergeable {
+        if index.mirrors.remove(&key).is_some() && !unmergeable {
             let _ = std::fs::remove_file(&mirror);
+            prune_store(&mirror);
         }
         save(config, &index);
     }
@@ -539,22 +605,54 @@ pub mod session {
     pub fn retire(config: &Config) -> usize {
         let index = load(config);
         let mut removed = 0;
-        for entry in &index.mirrors {
+        for (entry, source) in &index.mirrors {
             let mirror = PathBuf::from(entry);
             if !mirror.exists() {
                 continue;
             }
             // Never delete work that was never merged: a mirror that fails to
             // compile is left on disk for the user to inspect.
-            if newer(&mirror, &source_path(&mirror)) && compile(&mirror).is_err() {
+            let source = PathBuf::from(source);
+            if newer(&mirror, &source) && compile_to(&mirror, &source).is_err() {
                 continue;
             }
             if std::fs::remove_file(&mirror).is_ok() {
                 removed += 1;
+                prune_store(&mirror);
             }
         }
         save(config, &Index::default());
         removed
+    }
+
+    /// Remove empty directories up to and including the store, taking the
+    /// self-ignore file with it once nothing else is left.
+    fn prune_store(mirror: &Path) {
+        let Some(store) = mirror
+            .ancestors()
+            .find(|d| d.ends_with(STORE_DIR))
+            .map(Path::to_path_buf)
+        else {
+            return;
+        };
+        for dir in mirror.ancestors().take_while(|d| *d != store) {
+            if std::fs::remove_dir(dir).is_err() {
+                break;
+            }
+        }
+        let empty_but_sealed = std::fs::read_dir(&store)
+            .into_iter()
+            .flatten()
+            .all(|entry| {
+                entry
+                    .as_ref()
+                    .map(|e| e.file_name() == ".gitignore")
+                    .unwrap_or(false)
+            });
+        if empty_but_sealed {
+            let _ = std::fs::remove_file(store.join(".gitignore"));
+            let _ = std::fs::remove_dir(&store);
+        }
     }
 
     fn newer(a: &Path, b: &Path) -> bool {
@@ -722,6 +820,31 @@ pub mod session {
 
             assert_eq!(retire(&config), 0, "nothing safely removable");
             assert!(served.mirror.exists(), "work the agent did is still there");
+        }
+
+        #[test]
+        fn test_store_is_workspace_local_and_uncommittable() {
+            let (dir, config, json) = env();
+            let served = ensure(&config, &json).expect("mirror");
+
+            let store = dir.path().join(".rtk");
+            assert!(
+                served.mirror.starts_with(&store),
+                "mirror lives in the store, not beside the source: {}",
+                served.mirror.display()
+            );
+            assert_eq!(
+                std::fs::read_to_string(store.join(".gitignore")).expect("seal"),
+                "*\n",
+                "the store ignores itself, so nothing here can be committed"
+            );
+            assert!(
+                !json.with_extension("toon").exists(),
+                "nothing lands next to the JSON"
+            );
+
+            retire(&config);
+            assert!(!store.exists(), "store removed once it holds nothing");
         }
 
         #[test]

@@ -70,7 +70,7 @@ fn pre_read_with(config: &Config, event: &Value) -> Option<String> {
     // a file we just served as a mirror is the expensive failure — a whole round
     // trip spent checking on us — so it counts against the session.
     if crate::core::tee::posthook_recently_read(config, path, RAW_REREAD_WINDOW_SECS) {
-        if mirror::mirror_path(json).exists() {
+        if mirror::session::mirror_for(json).exists() {
             mirror::session::strike(config);
         }
         mirror::session::pin_raw(config, json);
@@ -96,11 +96,13 @@ fn pre_read_with(config: &Config, event: &Value) -> Option<String> {
     // being told the mirror's name it addresses edits to the JSON and its TOON
     // anchor matches nothing. Name the file to edit, once per file.
     if served.first_time {
-        let source = json.file_name().and_then(|n| n.to_str());
-        let mirror = served.mirror.file_name().and_then(|n| n.to_str());
-        if let (Some(source), Some(mirror)) = (source, mirror) {
-            hook_output["additionalContext"] =
-                json!(format!("Edit {mirror} (TOON view of {source})."));
+        // The full mirror path, because Edit needs one and the store is not
+        // beside the source any more.
+        if let Some(source) = json.file_name().and_then(|n| n.to_str()) {
+            hook_output["additionalContext"] = json!(format!(
+                "Edit {} (TOON view of {source}).",
+                served.mirror.display()
+            ));
         }
     }
     Some(json!({ "hookSpecificOutput": hook_output }).to_string())
@@ -118,37 +120,39 @@ fn post_write_with(config: &Config, event: &Value) -> Option<String> {
     let file = Path::new(path);
 
     match file.extension().and_then(|e| e.to_str()) {
-        Some(mirror::MIRROR_EXT) => match mirror::compile(file) {
-            Ok(_) => None,
-            Err(e) => {
-                let source = mirror::source_path(file);
-                let gave_up = mirror::session::record_failure(config, file);
-                let context = if gave_up {
-                    format!(
-                        "{} still does not compile, so {} is unchanged: {e:#}\n\
+        Some(mirror::MIRROR_EXT) => {
+            let source = mirror::session::source_of(config, file);
+            match mirror::compile_to(file, &source) {
+                Ok(_) => None,
+                Err(e) => {
+                    let gave_up = mirror::session::record_failure(config, file);
+                    let context = if gave_up {
+                        format!(
+                            "{} still does not compile, so {} is unchanged: {e:#}\n\
                          Edit {} directly from here; the .toon is no longer in use.",
-                        file.display(),
-                        source.display(),
-                        source.display()
+                            file.display(),
+                            source.display(),
+                            source.display()
+                        )
+                    } else {
+                        format!(
+                            "{} did not compile, so {} was NOT updated: {e:#}",
+                            file.display(),
+                            source.display()
+                        )
+                    };
+                    Some(
+                        json!({
+                            "hookSpecificOutput": {
+                                "hookEventName": POST_TOOL_USE_KEY,
+                                "additionalContext": context,
+                            }
+                        })
+                        .to_string(),
                     )
-                } else {
-                    format!(
-                        "{} did not compile, so {} was NOT updated: {e:#}",
-                        file.display(),
-                        source.display()
-                    )
-                };
-                Some(
-                    json!({
-                        "hookSpecificOutput": {
-                            "hookEventName": POST_TOOL_USE_KEY,
-                            "additionalContext": context,
-                        }
-                    })
-                    .to_string(),
-                )
+                }
             }
-        },
+        }
         Some("json") => {
             // The agent edited the source directly, so it is working against
             // real bytes: stop serving a mirror for this file.
@@ -272,9 +276,14 @@ mod tests {
         let v: Value = serde_json::from_str(&out).expect("valid JSON");
         // The model asked for the JSON path and cannot see the swap, so the
         // note has to spell out which file its anchors belong to.
-        assert_eq!(
-            v["hookSpecificOutput"]["additionalContext"],
-            "Edit records.toon (TOON view of records.json)."
+        let note = v["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .expect("note");
+        assert!(note.starts_with("Edit "), "{note}");
+        assert!(note.contains(".rtk"), "names the store path: {note}");
+        assert!(
+            note.ends_with("(TOON view of records.json)."),
+            "names the source: {note}"
         );
 
         // A second read is the raw escape hatch, so the note cannot repeat
@@ -316,7 +325,7 @@ mod tests {
         std::fs::write(&json, rows(40)).expect("write");
         let config = config_for(&dir);
         pre_read_with(&config, &read_event(&json)).expect("redirected");
-        let mirror = mirror::mirror_path(&json);
+        let mirror = mirror::session::mirror_for(&json);
 
         let raw = std::fs::read_to_string(&json).expect("read");
         std::fs::write(&json, raw.replace("row_0", "renamed")).expect("write");
@@ -342,7 +351,7 @@ mod tests {
         std::fs::write(&json, rows(40)).expect("write");
         let config = config_for(&dir);
         pre_read_with(&config, &read_event(&json)).expect("redirected");
-        let mirror = mirror::mirror_path(&json);
+        let mirror = mirror::session::mirror_for(&json);
 
         let toon = std::fs::read_to_string(&mirror).expect("read");
         let broken = toon
