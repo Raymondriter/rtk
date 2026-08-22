@@ -21,7 +21,7 @@ use super::constants::{
     PI_CODING_AGENT_DIR_ENV, PI_DIR, PI_EXTENSIONS_SUBDIR, PI_LOCAL_DIR, PI_PLUGIN_FILE,
     POST_TOOL_USE_KEY, PRE_TOOL_USE_KEY, REWRITE_HOOK_FILE, SETTINGS_JSON,
 };
-use super::constants::{CLAUDE_SESSION_MATCHER, SESSION_END_KEY};
+use super::constants::{CLAUDE_SESSION_MATCHER, SESSION_END_KEY, SESSION_START_KEY};
 use super::integrity;
 use super::is_claude_hook_command;
 
@@ -559,7 +559,12 @@ fn remove_hook_from_json(root: &mut serde_json::Value) -> bool {
 
     let mut modified = false;
 
-    for event_key in [PRE_TOOL_USE_KEY, POST_TOOL_USE_KEY, SESSION_END_KEY] {
+    for event_key in [
+        PRE_TOOL_USE_KEY,
+        POST_TOOL_USE_KEY,
+        SESSION_END_KEY,
+        SESSION_START_KEY,
+    ] {
         let event_array = match hooks_obj.get_mut(event_key).and_then(|p| p.as_array_mut()) {
             Some(arr) => arr,
             None => continue,
@@ -1013,6 +1018,7 @@ fn patch_settings_json_command(
         (PRE_TOOL_USE_KEY, CLAUDE_PRE_MATCHER),
         (POST_TOOL_USE_KEY, CLAUDE_POST_MATCHER),
         (SESSION_END_KEY, CLAUDE_SESSION_MATCHER),
+        (SESSION_START_KEY, CLAUDE_SESSION_MATCHER),
     ];
     let missing: Vec<(&str, &str)> = events
         .iter()
@@ -7252,12 +7258,17 @@ mod tests {
             let settings = fs::read_to_string(claude_dir.join(SETTINGS_JSON)).unwrap();
             let count = settings.matches(CLAUDE_HOOK_COMMAND).count();
             assert_eq!(
-                count, 3,
-                "hook command appears once per event (PreToolUse + PostToolUse + SessionEnd)"
+                count, 4,
+                "hook command appears once per event (PreToolUse + PostToolUse + SessionEnd + SessionStart)"
             );
 
             let root: serde_json::Value = serde_json::from_str(&settings).unwrap();
-            for event in [PRE_TOOL_USE_KEY, POST_TOOL_USE_KEY, SESSION_END_KEY] {
+            for event in [
+                PRE_TOOL_USE_KEY,
+                POST_TOOL_USE_KEY,
+                SESSION_END_KEY,
+                SESSION_START_KEY,
+            ] {
                 let arr = root["hooks"][event].as_array().unwrap();
                 assert_eq!(arr.len(), 1, "{event} must hold exactly one entry");
             }

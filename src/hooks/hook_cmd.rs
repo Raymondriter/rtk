@@ -519,6 +519,10 @@ pub fn run_claude() -> Result<()> {
             super::toon_hook::run_session_end(&v);
             return Ok(());
         }
+        Some(super::constants::SESSION_START_KEY) => {
+            super::toon_hook::run_session_start(&v);
+            return Ok(());
+        }
         Some(PRE_TOOL_USE_KEY) | None => match v.get("tool_name").and_then(|t| t.as_str()) {
             Some("Edit") => {
                 super::edit_lens::run(&v);

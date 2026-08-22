@@ -8,7 +8,7 @@
 //! Fail-open like every other hook here: any error emits nothing and the
 //! original tool call proceeds untouched.
 
-use super::constants::{POST_TOOL_USE_KEY, PRE_TOOL_USE_KEY};
+use super::constants::{POST_TOOL_USE_KEY, PRE_TOOL_USE_KEY, SESSION_START_KEY};
 use crate::core::config::Config;
 use crate::core::lens::mirror;
 use serde_json::{json, Value};
@@ -22,6 +22,12 @@ const RAW_REREAD_WINDOW_SECS: u64 = 120;
 pub fn run_pre_read(event: &Value) {
     emit(std::panic::catch_unwind(std::panic::AssertUnwindSafe(
         || pre_read(event),
+    )));
+}
+
+pub fn run_session_start(event: &Value) {
+    emit(std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+        || session_start(event),
     )));
 }
 
@@ -134,6 +140,31 @@ fn post_write_with(config: &Config, event: &Value) -> Option<String> {
 }
 
 /// Compile anything pending and remove the session's mirrors.
+/// A mirror the model was not warned about costs a verification round trip,
+/// and one round trip replays the whole prefix — far more than a mirror ever
+/// saves. Warning once, before any tool call, is what makes the trade work.
+const MIRROR_NOTICE: &str = "System may serve a large .json as a .toon working copy. \
+Edit the .toon; it will automatically edit the json source.";
+
+fn session_start(_event: &Value) -> Option<String> {
+    if std::env::var("RTK_DISABLED").ok().as_deref() == Some("1") {
+        return None;
+    }
+    let config = Config::load().unwrap_or_default();
+    if !config.posthook.enabled || !config.toon.mirrors {
+        return None;
+    }
+    Some(
+        json!({
+            "hookSpecificOutput": {
+                "hookEventName": SESSION_START_KEY,
+                "additionalContext": MIRROR_NOTICE,
+            }
+        })
+        .to_string(),
+    )
+}
+
 fn session_end(_event: &Value) -> Option<String> {
     let config = Config::load().unwrap_or_default();
     mirror::session::retire(&config);
@@ -182,6 +213,22 @@ mod tests {
         assert!(Path::new(served).exists(), "mirror created on demand");
         assert!(
             std::fs::metadata(served).unwrap().len() < std::fs::metadata(&json).unwrap().len() / 2
+        );
+    }
+
+    #[test]
+    fn test_session_start_warns_before_any_tool_runs() {
+        let out = session_start(&json!({"hook_event_name": "SessionStart", "source": "startup"}))
+            .expect("notice emitted");
+        let v: Value = serde_json::from_str(&out).expect("valid JSON");
+        let notice = v["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .expect("context");
+        assert!(notice.contains(".toon"), "names the format: {notice}");
+        assert!(
+            notice.len() < 200,
+            "rides in the cached prefix, so it stays small: {} bytes",
+            notice.len()
         );
     }
 

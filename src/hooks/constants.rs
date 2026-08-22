@@ -8,7 +8,8 @@ pub const HOOKS_JSON: &str = "hooks.json";
 pub const PRE_TOOL_USE_KEY: &str = "PreToolUse";
 pub const POST_TOOL_USE_KEY: &str = "PostToolUse";
 pub const SESSION_END_KEY: &str = "SessionEnd";
-/// SessionEnd fires for every exit reason.
+pub const SESSION_START_KEY: &str = "SessionStart";
+/// SessionStart and SessionEnd fire for every start reason / exit reason.
 pub const CLAUDE_SESSION_MATCHER: &str = "*";
 pub const BEFORE_TOOL_KEY: &str = "BeforeTool";
 
