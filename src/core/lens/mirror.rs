@@ -368,9 +368,10 @@ pub mod session {
 
     /// A mirror must be this much smaller than its source to be worth serving.
     const MAX_MIRROR_RATIO: f64 = 0.8;
-    /// ...and must save at least this many bytes, several times the cost of
-    /// the one-line note that announces it.
-    const MIN_SAVED_BYTES: usize = 200;
+    /// Strikes — a check we provoked, or an edit we could not compile — before
+    /// mirrors stop for the session. Bounds the worst case to a fixed cost
+    /// instead of one detour per file.
+    const MAX_STRIKES: u32 = 2;
 
     #[derive(Debug, Default, Serialize, Deserialize)]
     struct Index {
@@ -380,6 +381,12 @@ pub mod session {
         skipped: BTreeSet<String>,
         /// Sources pinned to raw bytes for the rest of the session.
         raw: BTreeSet<String>,
+        /// Checks provoked and edits refused, session-wide.
+        #[serde(default)]
+        strikes: u32,
+        /// Mirrors that failed to compile, and how often.
+        #[serde(default)]
+        failures: std::collections::BTreeMap<String, u32>,
     }
 
     pub struct Served {
@@ -437,7 +444,8 @@ pub mod session {
         }
         let key = json.display().to_string();
         let mut index = load(config);
-        if index.raw.contains(&key) || index.skipped.contains(&key) {
+        if index.strikes >= MAX_STRIKES || index.raw.contains(&key) || index.skipped.contains(&key)
+        {
             return None;
         }
 
@@ -448,7 +456,9 @@ pub mod session {
                 save(config, &index);
                 return None;
             };
-            if !written.byte_identical || !worth_it(written.from_bytes, written.to_bytes) {
+            if !written.byte_identical
+                || !worth_it(written.from_bytes, written.to_bytes, &config.toon)
+            {
                 let _ = std::fs::remove_file(&mirror);
                 index.skipped.insert(key);
                 save(config, &index);
@@ -463,21 +473,57 @@ pub mod session {
         Some(Served { mirror, first_time })
     }
 
-    fn worth_it(source: usize, mirror: usize) -> bool {
+    /// The floor is set by round trips, not by payload. A measured session
+    /// replays ~50k tokens of cached prefix per round trip, so one check an
+    /// agent runs because it distrusts the view costs ~17,500 input-equivalent
+    /// tokens, while saved payload is worth ~1.85x its token count over the
+    /// rest of a session. The default 3000 bytes saved is ~750 tokens, ~1,390
+    /// input-equivalents — ahead as long as fewer than ~7% of mirrored reads
+    /// provoke a check.
+    fn worth_it(source: usize, mirror: usize, toon: &ToonConfig) -> bool {
         let saved = source.saturating_sub(mirror);
-        saved >= MIN_SAVED_BYTES && (mirror as f64) <= (source as f64) * MAX_MIRROR_RATIO
+        saved >= toon.min_saved_bytes && (mirror as f64) <= (source as f64) * MAX_MIRROR_RATIO
     }
 
     /// Pin a source to raw bytes for the rest of the session. Used when the
     /// agent asks for a line range, re-reads, or edits the JSON directly —
     /// all signals that it is working against real bytes.
+    /// Record something that cost a round trip. Past the limit the session
+    /// stops mirroring: a bounded loss beats an open-ended one.
+    pub fn strike(config: &Config) {
+        let mut index = load(config);
+        index.strikes = index.strikes.saturating_add(1);
+        save(config, &index);
+    }
+
+    /// A mirror that would not compile. The first failure is the agent's to
+    /// fix; a second on the same file means we are the problem, so the source
+    /// goes back to raw bytes and the caller says so.
+    pub fn record_failure(config: &Config, mirror: &Path) -> bool {
+        let mut index = load(config);
+        let count = index
+            .failures
+            .entry(mirror.display().to_string())
+            .or_insert(0);
+        *count += 1;
+        let give_up = *count >= 2;
+        index.strikes = index.strikes.saturating_add(1);
+        save(config, &index);
+        if give_up {
+            pin_raw(config, &source_path(mirror));
+        }
+        give_up
+    }
+
     pub fn pin_raw(config: &Config, json: &Path) {
         let mut index = load(config);
         if !index.raw.insert(json.display().to_string()) {
             return;
         }
         let mirror = mirror_path(json);
-        if index.mirrors.remove(&mirror.display().to_string()) {
+        let key = mirror.display().to_string();
+        let unmergeable = index.failures.contains_key(&key);
+        if index.mirrors.remove(&key) && !unmergeable {
             let _ = std::fs::remove_file(&mirror);
         }
         save(config, &index);
@@ -493,8 +539,10 @@ pub mod session {
             if !mirror.exists() {
                 continue;
             }
-            if newer(&mirror, &source_path(&mirror)) {
-                let _ = compile(&mirror);
+            // Never delete work that was never merged: a mirror that fails to
+            // compile is left on disk for the user to inspect.
+            if newer(&mirror, &source_path(&mirror)) && compile(&mirror).is_err() {
+                continue;
             }
             if std::fs::remove_file(&mirror).is_ok() {
                 removed += 1;
@@ -531,6 +579,7 @@ pub mod session {
             let mut config = Config::default();
             config.tee.directory = Some(dir.path().join("tee"));
             config.toon.min_bytes = 256;
+            config.toon.min_saved_bytes = 200;
             let json = dir.path().join("records.json");
             std::fs::write(&json, rows(40)).expect("write");
             (dir, config, json)
@@ -596,7 +645,7 @@ pub mod session {
             let source = std::fs::metadata(&poor).expect("stat").len() as usize;
             let toon = encode_view(&serde_json::json!({ "a": prose, "b": prose })).expect("toon");
             assert!(
-                !worth_it(source, toon.len()),
+                !worth_it(source, toon.len(), &config.toon),
                 "fixture must be a genuine non-win: {source} to {}",
                 toon.len()
             );
@@ -609,10 +658,67 @@ pub mod session {
 
         #[test]
         fn test_worth_it_thresholds() {
-            assert!(worth_it(10_000, 4_000), "big structural win");
-            assert!(!worth_it(10_000, 9_000), "10 percent is not worth a note");
-            assert!(!worth_it(600, 500), "ratio fine, absolute saving too small");
-            assert!(!worth_it(1_000, 1_200), "mirror larger than source");
+            let toon = ToonConfig::default();
+            assert!(worth_it(40_000, 10_000, &toon), "big structural win");
+            assert!(
+                !worth_it(40_000, 37_000, &toon),
+                "small ratio never repays a round trip"
+            );
+            assert!(
+                !worth_it(3_400, 1_000, &toon),
+                "2400 bytes saved is under the round-trip floor"
+            );
+            assert!(!worth_it(1_000, 1_200, &toon), "mirror larger than source");
+        }
+
+        #[test]
+        fn test_strikes_stop_the_session() {
+            let (dir, config, json) = env();
+            let other = dir.path().join("other.json");
+            std::fs::write(&other, rows(60)).expect("write");
+
+            assert!(ensure(&config, &json).is_some());
+            strike(&config);
+            assert!(ensure(&config, &other).is_some(), "one check is affordable");
+            strike(&config);
+            assert!(
+                ensure(&config, &dir.path().join("records.json")).is_none(),
+                "past the limit the session stops paying"
+            );
+        }
+
+        #[test]
+        fn test_second_compile_failure_hands_the_file_back() {
+            let (_dir, config, json) = env();
+            let served = ensure(&config, &json).expect("mirror");
+
+            assert!(
+                !record_failure(&config, &served.mirror),
+                "first failure is the agent's to fix"
+            );
+            assert!(
+                record_failure(&config, &served.mirror),
+                "a second means we are the problem"
+            );
+            assert!(
+                ensure(&config, &json).is_none(),
+                "source handed back to raw bytes"
+            );
+            assert!(
+                served.mirror.exists(),
+                "unmergeable edits are never deleted out from under the agent"
+            );
+        }
+
+        #[test]
+        fn test_retire_keeps_a_mirror_it_cannot_merge() {
+            let (_dir, config, json) = env();
+            let served = ensure(&config, &json).expect("mirror");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            std::fs::write(&served.mirror, "[3]{a,b}:\n  1,2,3,4,5\n").expect("write");
+
+            assert_eq!(retire(&config), 0, "nothing safely removable");
+            assert!(served.mirror.exists(), "work the agent did is still there");
         }
 
         #[test]

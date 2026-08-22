@@ -55,6 +55,12 @@ enabled = true              # PostToolUse output filtering (Claude Code)
 exclude_paths = []          # globs vs file_path/url, e.g. ["**/*.min.js"]
 tools = { read = true, grep = true, webfetch = true, websearch = true, glob = false, bash = true }
 
+[toon]                      # session TOON working copies for JSON reads
+mirrors = true
+min_bytes = 2048            # cheap pre-filter on file size
+min_saved_bytes = 3000      # a mirror must save this much to be worth serving
+exclude = ["package.json", "package-lock.json", "tsconfig.json", "composer.json"]
+
 [posthook.formats]          # per-format converter: "auto" | "off"
 json = "off"                # off by default: a converted view no file matches breaks Edit anchors
 web = "auto"

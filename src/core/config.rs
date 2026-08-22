@@ -231,6 +231,10 @@ pub struct ToonConfig {
     pub mirrors: bool,
     /// Files smaller than this are not worth a mirror.
     pub min_bytes: usize,
+    /// A mirror must save at least this many bytes to be served. The floor is
+    /// set by round trips: one check an agent runs because it distrusts the
+    /// view costs far more than a small payload saving returns.
+    pub min_saved_bytes: usize,
     /// Basenames that never get a mirror (hand-edited or tool-owned files).
     pub exclude: Vec<String>,
 }
@@ -240,6 +244,7 @@ impl Default for ToonConfig {
         Self {
             mirrors: true,
             min_bytes: 2048,
+            min_saved_bytes: 3000,
             exclude: vec![
                 "package.json".into(),
                 "package-lock.json".into(),

@@ -66,8 +66,13 @@ fn pre_read_with(config: &Config, event: &Value) -> Option<String> {
         return None;
     }
     // A second read means the agent wants the real thing: pin it raw for the
-    // rest of the session so the escape hatch never expires mid-task.
+    // rest of the session so the escape hatch never expires mid-task. Re-reading
+    // a file we just served as a mirror is the expensive failure — a whole round
+    // trip spent checking on us — so it counts against the session.
     if crate::core::tee::posthook_recently_read(config, path, RAW_REREAD_WINDOW_SECS) {
+        if mirror::mirror_path(json).exists() {
+            mirror::session::strike(config);
+        }
         mirror::session::pin_raw(config, json);
         return None;
     }
@@ -115,19 +120,34 @@ fn post_write_with(config: &Config, event: &Value) -> Option<String> {
     match file.extension().and_then(|e| e.to_str()) {
         Some(mirror::MIRROR_EXT) => match mirror::compile(file) {
             Ok(_) => None,
-            Err(e) => Some(
-                json!({
-                    "hookSpecificOutput": {
-                        "hookEventName": POST_TOOL_USE_KEY,
-                        "additionalContext": format!(
-                            "{} did not compile, so {} was NOT updated: {e:#}",
-                            file.display(),
-                            mirror::source_path(file).display()
-                        ),
-                    }
-                })
-                .to_string(),
-            ),
+            Err(e) => {
+                let source = mirror::source_path(file);
+                let gave_up = mirror::session::record_failure(config, file);
+                let context = if gave_up {
+                    format!(
+                        "{} still does not compile, so {} is unchanged: {e:#}\n\
+                         Edit {} directly from here; the .toon is no longer in use.",
+                        file.display(),
+                        source.display(),
+                        source.display()
+                    )
+                } else {
+                    format!(
+                        "{} did not compile, so {} was NOT updated: {e:#}",
+                        file.display(),
+                        source.display()
+                    )
+                };
+                Some(
+                    json!({
+                        "hookSpecificOutput": {
+                            "hookEventName": POST_TOOL_USE_KEY,
+                            "additionalContext": context,
+                        }
+                    })
+                    .to_string(),
+                )
+            }
         },
         Some("json") => {
             // The agent edited the source directly, so it is working against
@@ -146,13 +166,21 @@ fn post_write_with(config: &Config, event: &Value) -> Option<String> {
 const MIRROR_NOTICE: &str = "System may serve a large .json as a .toon working copy. \
 Edit the .toon; it will automatically edit the json source.";
 
-fn session_start(_event: &Value) -> Option<String> {
+fn session_start(event: &Value) -> Option<String> {
     if std::env::var("RTK_DISABLED").ok().as_deref() == Some("1") {
         return None;
     }
     let config = Config::load().unwrap_or_default();
     if !config.posthook.enabled || !config.toon.mirrors {
         return None;
+    }
+    // A crashed session leaves its mirrors behind. Sweep them on a real start
+    // only: resume and compact fire here too, and their mirrors are live.
+    if matches!(
+        event.get("source").and_then(|s| s.as_str()),
+        Some("startup") | Some("clear") | None
+    ) {
+        mirror::session::retire(&config);
     }
     Some(
         json!({
@@ -180,6 +208,7 @@ mod tests {
         let mut config = Config::default();
         config.tee.directory = Some(dir.path().join("tee"));
         config.toon.min_bytes = 256;
+        config.toon.min_saved_bytes = 200;
         config
     }
 
