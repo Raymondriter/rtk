@@ -1234,7 +1234,18 @@ mod tests {
 
         // Stale row count: strict decode rejects it.
         let toon = std::fs::read_to_string(&mirror).expect("read");
-        std::fs::write(&mirror, toon.replace("[2]", "[9]")).expect("write");
+        let broken = toon
+            .lines()
+            .map(|l| {
+                if l.starts_with("  1,") {
+                    "  1,a,b,c,d,e,f,g,h"
+                } else {
+                    l
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(&mirror, broken).expect("write");
 
         let event = serde_json::json!({
             "tool_name": "Write",

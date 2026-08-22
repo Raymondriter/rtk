@@ -72,19 +72,30 @@ pub fn extract(json_path: &Path) -> Result<Written> {
 pub fn compile(mirror: &Path) -> Result<Written> {
     let toon = std::fs::read_to_string(mirror)
         .with_context(|| format!("Failed to read {}", mirror.display()))?;
-    let value = decode_view(&toon).with_context(|| {
+    // Deleting or adding a row leaves the `[N]` header stale, and a strict
+    // decode rejects the whole file for it. Reconcile the count with the rows
+    // actually present before decoding: an agent editing rows should not have
+    // to keep a running total.
+    let reconciled = reconcile_counts(&toon);
+    let value = decode_view(&reconciled).with_context(|| {
         format!(
-            "{} is not valid TOON (check row count and field list)",
+            "{} is not valid TOON (check the field list)",
             mirror.display()
         )
     })?;
-    // Verify: re-encoding the decoded value must reproduce the mirror.
+    // The mirror is what the next read serves, so keep it canonical: an edit
+    // that decodes but is spelled differently is rewritten, not rejected.
     match encode_view(&value) {
-        Some(re) if re.trim_end() == toon.trim_end() => {}
-        Some(_) => bail!(
-            "{} decodes but does not re-encode identically; refusing to write",
-            mirror.display()
-        ),
+        Some(re) if re.trim_end() != toon.trim_end() => {
+            let canonical = if toon.ends_with('\n') {
+                format!("{}\n", re.trim_end())
+            } else {
+                re.trim_end().to_string()
+            };
+            std::fs::write(mirror, &canonical)
+                .with_context(|| format!("Failed to write {}", mirror.display()))?;
+        }
+        Some(_) => {}
         None => bail!("{} could not be re-encoded", mirror.display()),
     }
 
@@ -109,6 +120,48 @@ pub fn compile(mirror: &Path) -> Result<Written> {
         to_bytes: rendered.len(),
         byte_identical: true,
     })
+}
+
+/// Rewrite every tabular `[N]` header to the number of rows that follow it.
+///
+/// A row is a line indented deeper than its header; the block ends at the first
+/// line that is not. Headers whose count already matches are left untouched, so
+/// a file needing no repair comes back byte-identical.
+fn reconcile_counts(toon: &str) -> String {
+    static HEADER: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(
+            r"^(?<indent>[ \t]*)(?<key>[^\[\]{}:]*)\[(?<count>\d+)\](?<fields>\{[^{}]*\}):[ \t]*$",
+        )
+        .expect("valid header pattern")
+    });
+
+    let lines: Vec<&str> = toon.lines().collect();
+    let mut out: Vec<String> = Vec::with_capacity(lines.len());
+    for (i, line) in lines.iter().enumerate() {
+        let Some(caps) = HEADER.captures(line) else {
+            out.push((*line).to_string());
+            continue;
+        };
+        let indent = caps.name("indent").map(|m| m.as_str()).unwrap_or("").len();
+        let rows = lines[i + 1..]
+            .iter()
+            .take_while(|row| !row.trim().is_empty() && row.len() - row.trim_start().len() > indent)
+            .count();
+        let declared: usize = caps["count"].parse().unwrap_or(rows);
+        if declared == rows {
+            out.push((*line).to_string());
+        } else {
+            out.push(format!(
+                "{}{}[{}]{}:",
+                &caps["indent"], &caps["key"], rows, &caps["fields"]
+            ));
+        }
+    }
+    let mut joined = out.join("\n");
+    if toon.ends_with('\n') {
+        joined.push('\n');
+    }
+    joined
 }
 
 /// Mirror and source agree (both directions decode to the same value).
@@ -199,15 +252,71 @@ mod tests {
     }
 
     #[test]
+    fn test_deleting_a_row_does_not_require_fixing_the_count() {
+        let dir = TempDir::new().expect("tempdir");
+        let json = setup(&dir, &fixture());
+        let mirror = extract(&json).expect("extract").path;
+
+        let toon = std::fs::read_to_string(&mirror).expect("read");
+        let kept: Vec<&str> = toon
+            .lines()
+            .filter(|l| !l.contains("1,user_1,user1@example.com"))
+            .collect();
+        std::fs::write(&mirror, kept.join("\n") + "\n").expect("write");
+
+        compile(&mirror).expect("a stale [N] is repaired, not rejected");
+        let value: Value =
+            serde_json::from_str(&std::fs::read_to_string(&json).expect("read")).expect("json");
+        assert_eq!(value.as_array().expect("array").len(), 119);
+        assert_eq!(value[1]["name"], "user_2", "the right row went");
+        assert!(
+            std::fs::read_to_string(&mirror)
+                .expect("read")
+                .starts_with("[119]"),
+            "mirror left consistent for the next edit"
+        );
+    }
+
+    #[test]
+    fn test_non_canonical_spelling_is_rewritten_not_rejected() {
+        let dir = TempDir::new().expect("tempdir");
+        let json = setup(&dir, &fixture());
+        let mirror = extract(&json).expect("extract").path;
+
+        let toon = std::fs::read_to_string(&mirror).expect("read");
+        // Same value, quoted where the encoder would not quote.
+        let edited = toon.replace(
+            "1,user_1,user1@example.com,false,2.5",
+            "1,\"user_1\",user1@example.com,false,2.5",
+        );
+        assert_ne!(edited, toon, "test edit applies");
+        std::fs::write(&mirror, &edited).expect("write");
+
+        compile(&mirror).expect("decodes, so it is accepted");
+        let value: Value =
+            serde_json::from_str(&std::fs::read_to_string(&json).expect("read")).expect("json");
+        assert_eq!(value[1]["name"], "user_1");
+        assert_eq!(
+            std::fs::read_to_string(&mirror).expect("read"),
+            toon,
+            "mirror restored to canonical form"
+        );
+    }
+
+    #[test]
     fn test_invalid_mirror_never_touches_source() {
         let dir = TempDir::new().expect("tempdir");
         let raw = fixture();
         let json = setup(&dir, &raw);
         let mirror = extract(&json).expect("extract").path;
 
-        // Stale row count: strict decode must reject it.
+        // A row missing fields: the shape is broken, not just the tally.
         let toon = std::fs::read_to_string(&mirror).expect("read");
-        std::fs::write(&mirror, toon.replace("[120]", "[999]")).expect("write");
+        std::fs::write(
+            &mirror,
+            toon.replace("1,user_1,user1@example.com,false,2.5", "1,user_1"),
+        )
+        .expect("write");
 
         assert!(compile(&mirror).is_err(), "malformed mirror is refused");
         assert_eq!(

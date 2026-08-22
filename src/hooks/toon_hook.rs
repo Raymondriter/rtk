@@ -316,7 +316,18 @@ mod tests {
         let mirror = mirror::mirror_path(&json);
 
         let toon = std::fs::read_to_string(&mirror).expect("read");
-        std::fs::write(&mirror, toon.replace("[40]", "[41]")).expect("write");
+        let broken = toon
+            .lines()
+            .map(|l| {
+                if l.starts_with("  1,") {
+                    "  1,a,b,c,d,e,f,g,h"
+                } else {
+                    l
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(&mirror, broken).expect("write");
         let ev = json!({
             "tool_name": "Edit",
             "tool_input": {"file_path": mirror.display().to_string()}
