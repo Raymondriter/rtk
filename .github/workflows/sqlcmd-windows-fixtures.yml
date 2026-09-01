@@ -61,6 +61,20 @@ jobs:
             (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToUpperInvariant()
           }
 
+          function Get-Sha256Bytes {
+            param(
+              [Parameter(Mandatory)]
+              [AllowEmptyCollection()]
+              [byte[]] $Bytes
+            )
+            $hasher = [System.Security.Cryptography.SHA256]::Create()
+            try {
+              [Convert]::ToHexString($hasher.ComputeHash($Bytes, 0, $Bytes.Length))
+            } finally {
+              $hasher.Dispose()
+            }
+          }
+
           function Assert-Sha256 {
             param(
               [Parameter(Mandatory)][string] $Name,
@@ -268,8 +282,14 @@ jobs:
                 }
               }
             }
+            [byte[]]$publicBytes = [byte[]]::new(0)
+            if ($redacted) {
+              $publicBytes = $strictEncoding.GetBytes($text)
+            } else {
+              $publicBytes = $bytes
+            }
             [pscustomobject]@{
-              Bytes = if ($redacted) { $strictEncoding.GetBytes($text) } else { $bytes }
+              Bytes = $publicBytes
               Redacted = $redacted
               Encoding = "code-page-$TextCodePage"
             }
@@ -284,13 +304,12 @@ jobs:
               $rawHash = Get-Sha256 -Path $stream.Path
               $rawLength = (Get-Item -LiteralPath $stream.Path).Length
               $publicCapture = Get-PublicCapture -Path $stream.Path -TextCodePage $Capture.TextCodePage
-              $publicHash = [Convert]::ToHexString(
-                [System.Security.Cryptography.SHA256]::HashData($publicCapture.Bytes)
-              )
-              $base64 = [Convert]::ToBase64String($publicCapture.Bytes)
+              [byte[]]$publicBytes = $publicCapture.Bytes
+              $publicHash = Get-Sha256Bytes -Bytes $publicBytes
+              $base64 = [Convert]::ToBase64String($publicBytes)
               Write-Host "FIXTURE_BEGIN name=$($Capture.Name) stream=$($stream.Name) exit_code=$($Capture.ExitCode)"
               Write-Host "RAW bytes=$rawLength sha256=$rawHash"
-              Write-Host "PUBLIC bytes=$($publicCapture.Bytes.Length) sha256=$publicHash encoding=$($publicCapture.Encoding) redacted=$($publicCapture.Redacted.ToString().ToLowerInvariant())"
+              Write-Host "PUBLIC bytes=$($publicBytes.Length) sha256=$publicHash encoding=$($publicCapture.Encoding) redacted=$($publicCapture.Redacted.ToString().ToLowerInvariant())"
               Write-Host "BASE64 $base64"
               Write-Host "FIXTURE_END name=$($Capture.Name) stream=$($stream.Name)"
             }
