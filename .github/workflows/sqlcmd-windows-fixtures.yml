@@ -42,6 +42,19 @@ jobs:
           foreach ($directory in @($root, $downloads, $media, $goRoot, $odbcToolsRoot, $captureRoot)) {
             New-Item -ItemType Directory -Path $directory -Force | Out-Null
           }
+          [System.Text.Encoding]::RegisterProvider([System.Text.CodePagesEncodingProvider]::Instance)
+
+          function Get-StrictEncoding {
+            param([Parameter(Mandatory)][int] $CodePage)
+            if ($CodePage -eq 65001) {
+              return [System.Text.UTF8Encoding]::new($false, $true)
+            }
+            [System.Text.Encoding]::GetEncoding(
+              $CodePage,
+              [System.Text.EncoderFallback]::ExceptionFallback,
+              [System.Text.DecoderFallback]::ExceptionFallback
+            )
+          }
 
           function Get-Sha256 {
             param([Parameter(Mandatory)][string] $Path)
@@ -149,7 +162,8 @@ jobs:
               [Parameter(Mandatory)][string] $Name,
               [Parameter(Mandatory)][string] $FilePath,
               [Parameter(Mandatory)][string[]] $ArgumentList,
-              [AllowNull()][string] $StandardInputText = $null
+              [AllowNull()][string] $StandardInputText = $null,
+              [int] $TextCodePage = 65001
             )
             $stdoutPath = Join-Path $captureRoot "$Name.stdout.bin"
             $stderrPath = Join-Path $captureRoot "$Name.stderr.bin"
@@ -216,14 +230,18 @@ jobs:
               ExitCode = $exitCode
               StdoutPath = $stdoutPath
               StderrPath = $stderrPath
+              TextCodePage = $TextCodePage
             }
           }
 
           function Get-PublicCapture {
-            param([Parameter(Mandatory)][string] $Path)
+            param(
+              [Parameter(Mandatory)][string] $Path,
+              [Parameter(Mandatory)][int] $TextCodePage
+            )
             $bytes = [System.IO.File]::ReadAllBytes($Path)
-            $strictUtf8 = [System.Text.UTF8Encoding]::new($false, $true)
-            $text = $strictUtf8.GetString($bytes)
+            $strictEncoding = Get-StrictEncoding -CodePage $TextCodePage
+            $text = $strictEncoding.GetString($bytes)
             $redacted = $false
             $replacements = @(
               [pscustomobject]@{ Value = $env:RUNNER_TEMP; Token = '<RUNNER_TEMP>' },
@@ -251,9 +269,9 @@ jobs:
               }
             }
             [pscustomobject]@{
-              Bytes = if ($redacted) { $strictUtf8.GetBytes($text) } else { $bytes }
+              Bytes = if ($redacted) { $strictEncoding.GetBytes($text) } else { $bytes }
               Redacted = $redacted
-              Encoding = if ($redacted) { 'utf-8' } else { 'raw-bytes' }
+              Encoding = "code-page-$TextCodePage"
             }
           }
 
@@ -265,7 +283,7 @@ jobs:
             )) {
               $rawHash = Get-Sha256 -Path $stream.Path
               $rawLength = (Get-Item -LiteralPath $stream.Path).Length
-              $publicCapture = Get-PublicCapture -Path $stream.Path
+              $publicCapture = Get-PublicCapture -Path $stream.Path -TextCodePage $Capture.TextCodePage
               $publicHash = [Convert]::ToHexString(
                 [System.Security.Cryptography.SHA256]::HashData($publicCapture.Bytes)
               )
@@ -284,8 +302,8 @@ jobs:
               [ValidateSet('stdout', 'stderr')][string] $Stream
             )
             $path = if ($Stream -eq 'stdout') { $Capture.StdoutPath } else { $Capture.StderrPath }
-            $strictUtf8 = [System.Text.UTF8Encoding]::new($false, $true)
-            $strictUtf8.GetString([System.IO.File]::ReadAllBytes($path))
+            $strictEncoding = Get-StrictEncoding -CodePage $Capture.TextCodePage
+            $strictEncoding.GetString([System.IO.File]::ReadAllBytes($path))
           }
 
           $expressPath = Join-Path $downloads 'SQLEXPR_x64_ENU.exe'
@@ -465,6 +483,13 @@ jobs:
           if ($LASTEXITCODE -ne 0) {
             throw "Failed to select UTF-8 console code page: exit_code=$LASTEXITCODE"
           }
+          $odbcOutputCodePage = [System.Globalization.CultureInfo]::CurrentCulture.TextInfo.OEMCodePage
+          if ($odbcOutputCodePage -le 0) {
+            throw "Could not resolve the Windows OEM code page: value=$odbcOutputCodePage"
+          }
+          [void](Get-StrictEncoding -CodePage $odbcOutputCodePage)
+          Write-Host "OUTPUT_ENCODING client=odbc code_page=$odbcOutputCodePage source=windows_oem"
+          Write-Host 'OUTPUT_ENCODING client=go code_page=65001 source=native_utf8'
           $utf8Bom = [System.Text.UTF8Encoding]::new($true)
           $successScript = Join-Path $root 'fixture-success.sql'
           $routeScript = Join-Path $root 'fixture-route.sql'
@@ -514,7 +539,7 @@ jobs:
           $stdinSql = "SET NOCOUNT OFF; PRINT N'fixture-stdin-message'; SELECT CAST(N'stdin-mode' AS nvarchar(16)) AS stdin_mode;`r`nGO`r`n"
 
           $captures = [System.Collections.Generic.List[object]]::new()
-          $odbcVersion = Invoke-ByteCapture 'odbc-help' $odbcSqlcmd @('-?')
+          $odbcVersion = Invoke-ByteCapture 'odbc-help' $odbcSqlcmd @('-?') -TextCodePage $odbcOutputCodePage
           $goVersion = Invoke-ByteCapture 'go-version' $goSqlcmd @('--version')
           $goQueryHelp = Invoke-ByteCapture 'go-query-help' $goSqlcmd @('query', '--help')
           if ($odbcVersion.ExitCode -ne 0 -or $goVersion.ExitCode -ne 0 -or $goQueryHelp.ExitCode -ne 0) {
@@ -541,7 +566,7 @@ jobs:
           $goTransportArguments = $goConnection + @('-b', '-h', '-1', '-W', '-Q', $transportQuery)
           $odbcTransport = $null
           for ($attempt = 1; $attempt -le 12; $attempt++) {
-            $candidate = Invoke-ByteCapture 'odbc-transport' $odbcSqlcmd $odbcTransportArguments
+            $candidate = Invoke-ByteCapture 'odbc-transport' $odbcSqlcmd $odbcTransportArguments -TextCodePage $odbcOutputCodePage
             if ($candidate.ExitCode -eq 0 -and (Get-CaptureText $candidate 'stdout') -match 'Shared memory\|(NTLM|KERBEROS)\|1\|17\.0\.1000\.7\|4') {
               $odbcTransport = $candidate
               break
@@ -562,14 +587,14 @@ jobs:
           }
 
           foreach ($client in @(
-            [pscustomobject]@{ Name = 'odbc'; Path = $odbcSqlcmd; Connection = $odbcConnection },
-            [pscustomobject]@{ Name = 'go'; Path = $goSqlcmd; Connection = $goConnection }
+            [pscustomobject]@{ Name = 'odbc'; Path = $odbcSqlcmd; Connection = $odbcConnection; TextCodePage = $odbcOutputCodePage },
+            [pscustomobject]@{ Name = 'go'; Path = $goSqlcmd; Connection = $goConnection; TextCodePage = 65001 }
           )) {
-            $success = Invoke-ByteCapture "$($client.Name)-success-default" $client.Path ($client.Connection + @('-i', $successScript))
-            $query = Invoke-ByteCapture "$($client.Name)-query-default" $client.Path ($client.Connection + @('-Q', $querySql))
-            $stdin = Invoke-ByteCapture -Name "$($client.Name)-stdin-default" -FilePath $client.Path -ArgumentList $client.Connection -StandardInputText $stdinSql
-            $route = Invoke-ByteCapture "$($client.Name)-route-r1" $client.Path ($client.Connection + @('-r1', '-i', $routeScript))
-            $failure = Invoke-ByteCapture "$($client.Name)-error-b-r1" $client.Path ($client.Connection + @('-b', '-r1', '-i', $errorScript))
+            $success = Invoke-ByteCapture "$($client.Name)-success-default" $client.Path ($client.Connection + @('-i', $successScript)) -TextCodePage $client.TextCodePage
+            $query = Invoke-ByteCapture "$($client.Name)-query-default" $client.Path ($client.Connection + @('-Q', $querySql)) -TextCodePage $client.TextCodePage
+            $stdin = Invoke-ByteCapture -Name "$($client.Name)-stdin-default" -FilePath $client.Path -ArgumentList $client.Connection -StandardInputText $stdinSql -TextCodePage $client.TextCodePage
+            $route = Invoke-ByteCapture "$($client.Name)-route-r1" $client.Path ($client.Connection + @('-r1', '-i', $routeScript)) -TextCodePage $client.TextCodePage
+            $failure = Invoke-ByteCapture "$($client.Name)-error-b-r1" $client.Path ($client.Connection + @('-b', '-r1', '-i', $errorScript)) -TextCodePage $client.TextCodePage
             if ($success.ExitCode -ne 0 -or $query.ExitCode -ne 0 -or $stdin.ExitCode -ne 0 -or
                 $route.ExitCode -ne 0 -or $failure.ExitCode -eq 0) {
               throw "$($client.Name) returned an unexpected fixture exit code"
@@ -587,13 +612,17 @@ jobs:
             foreach ($marker in @(
               'fixture-message-before', '  alpha  ', 'utf16_units', 'a  b   c',
               'first', 'second', 'third', 'zero_rows', '(3 rows affected)',
-              '--------------------', 'tail', 'café', '漢字', 'nocount-on',
-              '😀', 'empty_text', 'null_text', 'NULL', '(0 rows affected)',
+              '--------------------', 'tail', 'café', 'nocount-on',
+              'empty_text', 'null_text', 'NULL', '(0 rows affected)',
               'fixture-message-after'
             )) {
               if (-not $successStdout.Contains($marker)) {
                 throw "$($client.Name) default fixture is missing marker: $marker"
               }
+            }
+            if ($client.Name -eq 'go' -and
+                (-not $successStdout.Contains('漢字') -or -not $successStdout.Contains('😀'))) {
+              throw 'go default fixture did not preserve non-OEM Unicode markers'
             }
             if ($successStderr.Length -ne 0 -or ([regex]::Matches($successStdout, 'W')).Count -ne 96 -or
                 ([regex]::Matches($successStdout, [regex]::Escape('(3 rows affected)'))).Count -lt 2 -or
@@ -613,7 +642,7 @@ jobs:
             [void]$captures.Add($failure)
           }
 
-          Write-Host 'FIXTURE_EXPECTATION significant_edges_utf16_units=9 wide_value_characters=96 modern_query_live_capture=false'
+          Write-Host "FIXTURE_EXPECTATION significant_edges_utf16_units=9 wide_value_characters=96 modern_query_live_capture=false odbc_oem_code_page=$odbcOutputCodePage"
           foreach ($capture in $captures) {
             Write-CaptureRecord -Capture $capture
           }
