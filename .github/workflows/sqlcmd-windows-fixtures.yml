@@ -1,0 +1,643 @@
+name: SQLCMD Windows fixture capture
+
+on:
+  push:
+    branches:
+      - chore/sqlcmd-windows-fixtures-1832
+    paths:
+      - .github/workflows/sqlcmd-windows-fixtures.yml
+
+permissions: {}
+
+concurrency:
+  group: sqlcmd-windows-fixtures-1832
+  cancel-in-progress: true
+
+jobs:
+  capture:
+    if: >-
+      github.repository == 'Raymondriter/rtk' &&
+      github.ref == 'refs/heads/chore/sqlcmd-windows-fixtures-1832' &&
+      github.event_name == 'push' &&
+      github.event.repository.private == false &&
+      github.actor == 'Raymondriter'
+    runs-on: windows-2025
+    timeout-minutes: 45
+
+    steps:
+      - name: Install SQLCMD variants and capture synthetic fixtures
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $ProgressPreference = 'SilentlyContinue'
+          Set-StrictMode -Version Latest
+          Write-Host 'CONSENT_SCOPE sql_server_license=true odbc_license=true sqlcmd_utility_license=true privacy_notice=true express_diagnostics_unavoidable=true runner_ephemeral=true'
+
+          $root = Join-Path $env:RUNNER_TEMP 'sqlcmd-fixtures-1832'
+          $downloads = Join-Path $root 'downloads'
+          $media = Join-Path $root 'sql-media'
+          $goRoot = Join-Path $root 'go-sqlcmd'
+          $odbcToolsRoot = Join-Path $root 'odbc-tools-17.0.4055.5'
+          $captureRoot = Join-Path $root 'captures'
+          foreach ($directory in @($root, $downloads, $media, $goRoot, $odbcToolsRoot, $captureRoot)) {
+            New-Item -ItemType Directory -Path $directory -Force | Out-Null
+          }
+
+          function Get-Sha256 {
+            param([Parameter(Mandatory)][string] $Path)
+            (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToUpperInvariant()
+          }
+
+          function Assert-Sha256 {
+            param(
+              [Parameter(Mandatory)][string] $Name,
+              [Parameter(Mandatory)][string] $Path,
+              [Parameter(Mandatory)][string] $Expected
+            )
+            $actual = Get-Sha256 -Path $Path
+            if ($actual -ne $Expected.ToUpperInvariant()) {
+              throw "$Name SHA-256 mismatch"
+            }
+            Write-Host "VERIFIED_HASH name=$Name sha256=$actual"
+          }
+
+          function Get-FourPartProductVersion {
+            param(
+              [Parameter(Mandatory)][string] $Name,
+              [Parameter(Mandatory)][string] $Path
+            )
+            $text = (Get-Item -LiteralPath $Path).VersionInfo.ProductVersion
+            $match = [regex]::Match($text, '(?<!\d)(\d+)\.(\d+)\.(\d+)\.(\d+)(?!\d)')
+            if (-not $match.Success) {
+              throw "$Name does not expose a four-part product version"
+            }
+            [System.Version]::new(
+              [int]$match.Groups[1].Value,
+              [int]$match.Groups[2].Value,
+              [int]$match.Groups[3].Value,
+              [int]$match.Groups[4].Value
+            )
+          }
+
+          function Assert-MicrosoftSignature {
+            param(
+              [Parameter(Mandatory)][string] $Name,
+              [Parameter(Mandatory)][string] $Path
+            )
+            $signature = Get-AuthenticodeSignature -LiteralPath $Path
+            if ($signature.Status -ne [System.Management.Automation.SignatureStatus]::Valid) {
+              throw "$Name does not have a valid Authenticode signature"
+            }
+            $signer = $signature.SignerCertificate.GetNameInfo(
+              [System.Security.Cryptography.X509Certificates.X509NameType]::SimpleName,
+              $false
+            )
+            if ($signer -ne 'Microsoft Corporation') {
+              throw "$Name is not signed by Microsoft Corporation"
+            }
+            Write-Host "VERIFIED_SIGNATURE name=$Name signer=Microsoft_Corporation"
+          }
+
+          function Invoke-QuietProcess {
+            param(
+              [Parameter(Mandatory)][string] $Name,
+              [Parameter(Mandatory)][string] $FilePath,
+              [Parameter(Mandatory)][string[]] $ArgumentList,
+              [int[]] $AllowedExitCodes = @(0)
+            )
+            $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
+            $startInfo.FileName = $FilePath
+            $startInfo.UseShellExecute = $false
+            $startInfo.CreateNoWindow = $true
+            $startInfo.RedirectStandardOutput = $true
+            $startInfo.RedirectStandardError = $true
+            foreach ($variableName in @($startInfo.Environment.Keys)) {
+              if ($variableName.StartsWith('SQLCMD', [System.StringComparison]::OrdinalIgnoreCase) -or
+                  $variableName -eq 'OSQLPASSWORD' -or
+                  $variableName -in @('GITHUB_TOKEN', 'GH_TOKEN', 'ACTIONS_RUNTIME_TOKEN', 'ACTIONS_ID_TOKEN_REQUEST_TOKEN')) {
+                [void]$startInfo.Environment.Remove($variableName)
+              }
+            }
+            foreach ($argument in $ArgumentList) {
+              [void]$startInfo.ArgumentList.Add($argument)
+            }
+
+            $process = [System.Diagnostics.Process]::new()
+            try {
+              $process.StartInfo = $startInfo
+              if (-not $process.Start()) {
+                throw "$Name failed to start"
+              }
+              $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+              $stderrTask = $process.StandardError.ReadToEndAsync()
+              $process.WaitForExit()
+              [System.Threading.Tasks.Task]::WaitAll(
+                [System.Threading.Tasks.Task[]]@($stdoutTask, $stderrTask)
+              )
+              $exitCode = $process.ExitCode
+            } finally {
+              $process.Dispose()
+            }
+            if ($AllowedExitCodes -notcontains $exitCode) {
+              throw "$Name failed with exit code $exitCode"
+            }
+            Write-Host "PROCESS_OK name=$Name exit_code=$exitCode"
+          }
+
+          function Invoke-ByteCapture {
+            param(
+              [Parameter(Mandatory)][string] $Name,
+              [Parameter(Mandatory)][string] $FilePath,
+              [Parameter(Mandatory)][string[]] $ArgumentList,
+              [AllowNull()][string] $StandardInputText = $null
+            )
+            $stdoutPath = Join-Path $captureRoot "$Name.stdout.bin"
+            $stderrPath = Join-Path $captureRoot "$Name.stderr.bin"
+            $stdoutStream = [System.IO.File]::Open(
+              $stdoutPath,
+              [System.IO.FileMode]::Create,
+              [System.IO.FileAccess]::Write,
+              [System.IO.FileShare]::Read
+            )
+            $stderrStream = [System.IO.File]::Open(
+              $stderrPath,
+              [System.IO.FileMode]::Create,
+              [System.IO.FileAccess]::Write,
+              [System.IO.FileShare]::Read
+            )
+            $process = $null
+            try {
+              $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
+              $startInfo.FileName = $FilePath
+              $startInfo.UseShellExecute = $false
+              $startInfo.CreateNoWindow = $true
+              $startInfo.RedirectStandardOutput = $true
+              $startInfo.RedirectStandardError = $true
+              $startInfo.RedirectStandardInput = $null -ne $StandardInputText
+              if ($null -ne $StandardInputText) {
+                $startInfo.StandardInputEncoding = [System.Text.UTF8Encoding]::new($false)
+              }
+              foreach ($variableName in @($startInfo.Environment.Keys)) {
+                if ($variableName.StartsWith('SQLCMD', [System.StringComparison]::OrdinalIgnoreCase) -or
+                    $variableName -eq 'OSQLPASSWORD' -or
+                    $variableName -in @('GITHUB_TOKEN', 'GH_TOKEN', 'ACTIONS_RUNTIME_TOKEN', 'ACTIONS_ID_TOKEN_REQUEST_TOKEN')) {
+                  [void]$startInfo.Environment.Remove($variableName)
+                }
+              }
+              foreach ($argument in $ArgumentList) {
+                [void]$startInfo.ArgumentList.Add($argument)
+              }
+
+              $process = [System.Diagnostics.Process]::new()
+              $process.StartInfo = $startInfo
+              if (-not $process.Start()) {
+                throw "$Name failed to start"
+              }
+              $stdoutTask = $process.StandardOutput.BaseStream.CopyToAsync($stdoutStream)
+              $stderrTask = $process.StandardError.BaseStream.CopyToAsync($stderrStream)
+              if ($null -ne $StandardInputText) {
+                $process.StandardInput.Write($StandardInputText)
+                $process.StandardInput.Close()
+              }
+              $process.WaitForExit()
+              [System.Threading.Tasks.Task]::WaitAll(
+                [System.Threading.Tasks.Task[]]@($stdoutTask, $stderrTask)
+              )
+              $exitCode = $process.ExitCode
+            } finally {
+              if ($null -ne $process) {
+                $process.Dispose()
+              }
+              $stdoutStream.Dispose()
+              $stderrStream.Dispose()
+            }
+            [pscustomobject]@{
+              Name = $Name
+              ExitCode = $exitCode
+              StdoutPath = $stdoutPath
+              StderrPath = $stderrPath
+            }
+          }
+
+          function Get-PublicCapture {
+            param([Parameter(Mandatory)][string] $Path)
+            $bytes = [System.IO.File]::ReadAllBytes($Path)
+            $strictUtf8 = [System.Text.UTF8Encoding]::new($false, $true)
+            $text = $strictUtf8.GetString($bytes)
+            $redacted = $false
+            $replacements = @(
+              [pscustomobject]@{ Value = $env:RUNNER_TEMP; Token = '<RUNNER_TEMP>' },
+              [pscustomobject]@{ Value = $env:GITHUB_WORKSPACE; Token = '<WORKSPACE>' },
+              [pscustomobject]@{ Value = $env:USERPROFILE; Token = '<USERPROFILE>' },
+              [pscustomobject]@{ Value = $env:COMPUTERNAME; Token = '<HOST>' },
+              [pscustomobject]@{ Value = $env:USERNAME; Token = '<USER>' }
+            )
+            foreach ($replacement in $replacements) {
+              if (-not [string]::IsNullOrWhiteSpace($replacement.Value)) {
+                $pattern = [System.Text.RegularExpressions.Regex]::Escape($replacement.Value)
+                if ([System.Text.RegularExpressions.Regex]::IsMatch(
+                    $text,
+                    $pattern,
+                    [System.Text.RegularExpressions.RegexOptions]::IgnoreCase
+                  )) {
+                  $redacted = $true
+                  $text = [System.Text.RegularExpressions.Regex]::Replace(
+                    $text,
+                    $pattern,
+                    $replacement.Token,
+                    [System.Text.RegularExpressions.RegexOptions]::IgnoreCase
+                  )
+                }
+              }
+            }
+            [pscustomobject]@{
+              Bytes = if ($redacted) { $strictUtf8.GetBytes($text) } else { $bytes }
+              Redacted = $redacted
+              Encoding = if ($redacted) { 'utf-8' } else { 'raw-bytes' }
+            }
+          }
+
+          function Write-CaptureRecord {
+            param([Parameter(Mandatory)] $Capture)
+            foreach ($stream in @(
+              [pscustomobject]@{ Name = 'stdout'; Path = $Capture.StdoutPath },
+              [pscustomobject]@{ Name = 'stderr'; Path = $Capture.StderrPath }
+            )) {
+              $rawHash = Get-Sha256 -Path $stream.Path
+              $rawLength = (Get-Item -LiteralPath $stream.Path).Length
+              $publicCapture = Get-PublicCapture -Path $stream.Path
+              $publicHash = [Convert]::ToHexString(
+                [System.Security.Cryptography.SHA256]::HashData($publicCapture.Bytes)
+              )
+              $base64 = [Convert]::ToBase64String($publicCapture.Bytes)
+              Write-Host "FIXTURE_BEGIN name=$($Capture.Name) stream=$($stream.Name) exit_code=$($Capture.ExitCode)"
+              Write-Host "RAW bytes=$rawLength sha256=$rawHash"
+              Write-Host "PUBLIC bytes=$($publicCapture.Bytes.Length) sha256=$publicHash encoding=$($publicCapture.Encoding) redacted=$($publicCapture.Redacted.ToString().ToLowerInvariant())"
+              Write-Host "BASE64 $base64"
+              Write-Host "FIXTURE_END name=$($Capture.Name) stream=$($stream.Name)"
+            }
+          }
+
+          function Get-CaptureText {
+            param(
+              [Parameter(Mandatory)] $Capture,
+              [ValidateSet('stdout', 'stderr')][string] $Stream
+            )
+            $path = if ($Stream -eq 'stdout') { $Capture.StdoutPath } else { $Capture.StderrPath }
+            $strictUtf8 = [System.Text.UTF8Encoding]::new($false, $true)
+            $strictUtf8.GetString([System.IO.File]::ReadAllBytes($path))
+          }
+
+          $expressPath = Join-Path $downloads 'SQLEXPR_x64_ENU.exe'
+          $odbcPath = Join-Path $downloads 'msodbcsql.msi'
+          $odbcToolsPath = Join-Path $downloads 'MsSqlCmdLnUtils.msi'
+          $goZipPath = Join-Path $downloads 'sqlcmd-windows-amd64.zip'
+
+          $drive = [System.IO.DriveInfo]::new([System.IO.Path]::GetPathRoot($root))
+          $availableGiB = [math]::Round($drive.AvailableFreeSpace / 1GB, 2)
+          if ($drive.AvailableFreeSpace -lt 8GB) {
+            throw "Insufficient runner disk: available_gib=$availableGiB required_gib=8"
+          }
+          Write-Host "DISK_PRECHECK available_gib=$availableGiB required_gib=8"
+
+          Invoke-WebRequest -Uri 'https://download.microsoft.com/download/dea8c210-c44a-4a9d-9d80-0c81578860c5/ENU/SQLEXPR_x64_ENU.exe' -OutFile $expressPath -MaximumRetryCount 3 -RetryIntervalSec 2
+          Invoke-WebRequest -Uri 'https://download.microsoft.com/download/7bf9fad4-0f21-486d-a750-fc990ded5624/amd64/1033/msodbcsql.msi' -OutFile $odbcPath -MaximumRetryCount 3 -RetryIntervalSec 2
+          Invoke-WebRequest -Uri 'https://download.microsoft.com/download/6f8fa386-26c0-4376-b779-66d2e22378e8/SqlCmdLnUtils17.0.4055.5/amd64/1033/MsSqlCmdLnUtils.msi' -OutFile $odbcToolsPath -MaximumRetryCount 3 -RetryIntervalSec 2
+          Invoke-WebRequest -Uri 'https://github.com/microsoft/go-sqlcmd/releases/download/v1.10.0/sqlcmd-windows-amd64.zip' -OutFile $goZipPath -MaximumRetryCount 3 -RetryIntervalSec 2
+
+          Assert-Sha256 'sql-server-2025-express' $expressPath '74AA90C11202A5524E769B9BC22531BAEF22D91E9B2D2E8C3CB99E89A65C5297'
+          Assert-Sha256 'odbc-driver-18.6.2.1' $odbcPath '20314529110DA3365A252164A657BDC837A18BE5839105AA5F5ACF0A8D2F4B82'
+          Assert-Sha256 'odbc-tools-17.0.4055.5' $odbcToolsPath '25C7208CD5BA98BEAE4F1A464625A78D3607498E990FDDE40FE59E747F2B8BAC'
+          Assert-Sha256 'go-sqlcmd-v1.10.0' $goZipPath 'A4C28332FCC6E497D655E53AC8F4939F4AB170F9CFD32D0FA5081B60F4D9D691'
+          Assert-MicrosoftSignature 'sql-server-2025-express' $expressPath
+          Assert-MicrosoftSignature 'odbc-driver-18.6.2.1' $odbcPath
+          Assert-MicrosoftSignature 'odbc-tools-17.0.4055.5' $odbcToolsPath
+
+          Invoke-QuietProcess -Name 'extract-sql-server-media' -FilePath $expressPath -ArgumentList @('/Q', "/x:$media")
+          $setupPath = Join-Path $media 'setup.exe'
+          if (-not (Test-Path -LiteralPath $setupPath -PathType Leaf)) {
+            throw 'SQL Server media extraction did not produce setup.exe'
+          }
+          Assert-MicrosoftSignature 'sql-server-2025-setup' $setupPath
+
+          $setupArguments = @(
+            '/Q',
+            '/ACTION=Install',
+            '/FEATURES=SQLEngine',
+            '/INSTANCENAME=RTKFIXTURE1832',
+            '/SQLSVCACCOUNT=NT Service\MSSQL$RTKFIXTURE1832',
+            '/SQLSVCSTARTUPTYPE=Manual',
+            '/ADDCURRENTUSERASSQLADMIN=True',
+            '/TCPENABLED=0',
+            '/NPENABLED=0',
+            '/BROWSERSVCSTARTUPTYPE=Disabled',
+            '/UpdateEnabled=False',
+            '/ENU',
+            '/IACCEPTSQLSERVERLICENSETERMS',
+            '/SUPPRESSPRIVACYSTATEMENTNOTICE'
+          )
+          Invoke-QuietProcess -Name 'install-sql-server-express' -FilePath $setupPath -ArgumentList $setupArguments -AllowedExitCodes @(0, 3010)
+
+          $msiexec = Join-Path $env:SystemRoot 'System32\msiexec.exe'
+          $odbcRegistration = 'HKLM:\SOFTWARE\ODBC\ODBCINST.INI\ODBC Driver 18 for SQL Server'
+          $odbcDriverDll = if (Test-Path -LiteralPath $odbcRegistration) {
+            (Get-ItemProperty -LiteralPath $odbcRegistration).Driver
+          } else {
+            $null
+          }
+          $expectedOdbcVersion = [System.Version]::new(18, 6, 2, 1)
+          $installedOdbcVersion = if ($null -ne $odbcDriverDll -and (Test-Path -LiteralPath $odbcDriverDll -PathType Leaf)) {
+            Get-FourPartProductVersion -Name 'installed-odbc-driver' -Path $odbcDriverDll
+          } else {
+            [System.Version]::new(0, 0, 0, 0)
+          }
+          if ($installedOdbcVersion.CompareTo($expectedOdbcVersion) -gt 0) {
+            throw "Runner ODBC Driver 18 is newer than the pinned fixture version: $installedOdbcVersion"
+          }
+          if ($installedOdbcVersion.CompareTo($expectedOdbcVersion) -lt 0) {
+            Invoke-QuietProcess -Name 'install-odbc-driver' -FilePath $msiexec -ArgumentList @('/i', $odbcPath, '/qn', '/norestart', 'IACCEPTMSODBCSQLLICENSETERMS=YES') -AllowedExitCodes @(0, 3010)
+          } else {
+            Write-Host "REUSED_COMPONENT name=odbc-driver version=$installedOdbcVersion reason=runner_version_matches_pin"
+          }
+          Invoke-QuietProcess -Name 'extract-odbc-tools' -FilePath $msiexec -ArgumentList @('/a', $odbcToolsPath, '/qn', '/norestart', "TARGETDIR=$odbcToolsRoot", 'IACCEPTMSSQLCMDLNUTILSLICENSETERMS=YES')
+
+          $zip = [System.IO.Compression.ZipFile]::OpenRead($goZipPath)
+          try {
+            $rootPrefix = [System.IO.Path]::GetFullPath($goRoot) + [System.IO.Path]::DirectorySeparatorChar
+            foreach ($entry in $zip.Entries) {
+              $destination = [System.IO.Path]::GetFullPath((Join-Path $goRoot $entry.FullName))
+              if (-not $destination.StartsWith($rootPrefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+                throw 'Go sqlcmd archive contains an unsafe path'
+              }
+            }
+          } finally {
+            $zip.Dispose()
+          }
+          [System.IO.Compression.ZipFile]::ExtractToDirectory($goZipPath, $goRoot, $true)
+          $goCandidates = @(Get-ChildItem -LiteralPath $goRoot -Filter 'sqlcmd.exe' -File -Recurse)
+          if ($goCandidates.Count -ne 1) {
+            throw "Expected one Go sqlcmd executable, found $($goCandidates.Count)"
+          }
+          $goSqlcmd = $goCandidates[0].FullName
+
+          $odbcSqlcmdCandidates = @(Get-ChildItem -LiteralPath $odbcToolsRoot -Filter 'sqlcmd.exe' -File -Recurse)
+          if ($odbcSqlcmdCandidates.Count -ne 1) {
+            throw "Expected one extracted ODBC sqlcmd executable, found $($odbcSqlcmdCandidates.Count)"
+          }
+          $odbcSqlcmd = $odbcSqlcmdCandidates[0].FullName
+          Assert-MicrosoftSignature 'odbc-sqlcmd-executable' $odbcSqlcmd
+
+          $driver = @(Get-OdbcDriver -Name 'ODBC Driver 18 for SQL Server' -Platform '64-bit')
+          if ($driver.Count -ne 1) {
+            throw "Expected one 64-bit ODBC Driver 18 registration, found $($driver.Count)"
+          }
+          $odbcSqlcmdVersion = Get-FourPartProductVersion -Name 'odbc-sqlcmd' -Path $odbcSqlcmd
+          if ($odbcSqlcmdVersion -ne [System.Version]::new(17, 0, 4055, 5)) {
+            throw "Unexpected ODBC sqlcmd version: $odbcSqlcmdVersion"
+          }
+          if (-not (Test-Path -LiteralPath $odbcRegistration)) {
+            throw 'ODBC Driver 18 registry entry is missing after setup'
+          }
+          $odbcDriverDll = (Get-ItemProperty -LiteralPath $odbcRegistration).Driver
+          if (-not (Test-Path -LiteralPath $odbcDriverDll -PathType Leaf)) {
+            throw 'ODBC Driver 18 DLL was not installed at its expected path'
+          }
+          Assert-MicrosoftSignature 'odbc-driver-dll' $odbcDriverDll
+          $odbcDriverVersionRaw = Get-FourPartProductVersion -Name 'odbc-driver' -Path $odbcDriverDll
+          $odbcDriverVersion = $odbcDriverVersionRaw.ToString()
+          if ($odbcDriverVersionRaw.CompareTo($expectedOdbcVersion) -ne 0) {
+            throw "Unexpected ODBC Driver 18 version: $odbcDriverVersion"
+          }
+          Write-Host "CLIENT_VERSION name=odbc-sqlcmd version=$odbcSqlcmdVersion"
+          Write-Host "CLIENT_VERSION name=odbc-driver version=$odbcDriverVersion"
+
+          $sqlService = Get-Service -Name 'MSSQL$RTKFIXTURE1832'
+          if ($sqlService.Status -ne 'Running') {
+            Start-Service -Name 'MSSQL$RTKFIXTURE1832'
+          }
+          $sqlService.WaitForStatus('Running', [TimeSpan]::FromSeconds(60))
+          $browser = Get-Service -Name 'SQLBrowser' -ErrorAction SilentlyContinue
+          if ($null -ne $browser) {
+            if ($browser.Status -ne 'Stopped') {
+              Stop-Service -Name 'SQLBrowser' -Force
+              $browser.WaitForStatus('Stopped', [TimeSpan]::FromSeconds(30))
+            }
+            Set-Service -Name 'SQLBrowser' -StartupType Disabled
+          }
+          $browserRecord = Get-CimInstance -ClassName Win32_Service | Where-Object Name -EQ 'SQLBrowser'
+          if ($null -ne $browserRecord -and
+              ($browserRecord.State -ne 'Stopped' -or $browserRecord.StartMode -ne 'Disabled' -or $browserRecord.ProcessId -ne 0)) {
+            throw "Unsafe SQL Browser state: state=$($browserRecord.State) start_mode=$($browserRecord.StartMode) pid=$($browserRecord.ProcessId)"
+          }
+
+          $instanceNames = Get-ItemProperty -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Microsoft SQL Server\Instance Names\SQL'
+          $instanceId = $instanceNames.RTKFIXTURE1832
+          if ([string]::IsNullOrWhiteSpace($instanceId)) {
+            throw 'Could not resolve the RTKFIXTURE1832 instance ID'
+          }
+          $protocolRoot = "HKLM:\SOFTWARE\Microsoft\Microsoft SQL Server\$instanceId\MSSQLServer\SuperSocketNetLib"
+          $sharedMemoryEnabled = (Get-ItemProperty -LiteralPath (Join-Path $protocolRoot 'Sm')).Enabled
+          $tcpEnabled = (Get-ItemProperty -LiteralPath (Join-Path $protocolRoot 'Tcp')).Enabled
+          $namedPipesEnabled = (Get-ItemProperty -LiteralPath (Join-Path $protocolRoot 'Np')).Enabled
+          if ($sharedMemoryEnabled -ne 1 -or $tcpEnabled -ne 0 -or $namedPipesEnabled -ne 0) {
+            throw "Unsafe SQL protocol state: sm=$sharedMemoryEnabled tcp=$tcpEnabled np=$namedPipesEnabled"
+          }
+          Write-Host 'PROTOCOL_STATE shared_memory=enabled tcp=disabled named_pipes=disabled sql_browser=disabled'
+
+          $serviceRecord = Get-CimInstance -ClassName Win32_Service | Where-Object Name -EQ 'MSSQL$RTKFIXTURE1832'
+          if ($null -eq $serviceRecord -or $serviceRecord.ProcessId -eq 0) {
+            throw 'Could not resolve the SQL Server service process ID'
+          }
+          $tcpListeners = @(
+            Get-NetTCPConnection -State Listen -ErrorAction Stop |
+              Where-Object OwningProcess -EQ $serviceRecord.ProcessId
+          )
+          $udpEndpoints = @(
+            Get-NetUDPEndpoint -ErrorAction Stop |
+              Where-Object OwningProcess -EQ $serviceRecord.ProcessId
+          )
+          if ($tcpListeners.Count -ne 0 -or $udpEndpoints.Count -ne 0) {
+            throw "SQL Server owns network endpoints: tcp=$($tcpListeners.Count) udp=$($udpEndpoints.Count)"
+          }
+          Write-Host 'NETWORK_STATE sql_server_tcp_listeners=0 sql_server_udp_endpoints=0'
+
+          chcp.com 65001 | Out-Null
+          if ($LASTEXITCODE -ne 0) {
+            throw "Failed to select UTF-8 console code page: exit_code=$LASTEXITCODE"
+          }
+          $utf8Bom = [System.Text.UTF8Encoding]::new($true)
+          $successScript = Join-Path $root 'fixture-success.sql'
+          $routeScript = Join-Path $root 'fixture-route.sql'
+          $errorScript = Join-Path $root 'fixture-error.sql'
+          $successSql = @'
+          SET NOCOUNT OFF;
+          PRINT N'fixture-message-before';
+          SELECT
+              CAST(N'  alpha  ' AS nvarchar(20)) AS significant_edges,
+              DATALENGTH(CAST(N'  alpha  ' AS nvarchar(20))) / 2 AS utf16_units,
+              CAST(N'a  b   c' AS nvarchar(20)) AS repeated_internal_spaces,
+              CAST(N'' AS nvarchar(10)) AS empty_text,
+              CAST(NULL AS nvarchar(10)) AS null_text;
+          RAISERROR(N'fixture-info-between', 0, 1) WITH NOWAIT;
+          SELECT ordinal, label
+          FROM (VALUES
+              (1, CAST(N'first' AS nvarchar(12))),
+              (2, CAST(N'second' AS nvarchar(12))),
+              (3, CAST(N'third' AS nvarchar(12)))
+          ) AS fixture_rows(ordinal, label)
+          ORDER BY ordinal;
+          SELECT CAST(N'never' AS nvarchar(12)) AS zero_rows WHERE 1 = 0;
+          SELECT CAST(N'(3 rows affected)' AS nvarchar(24)) AS footer_shaped_data;
+          SELECT CAST(N'--------------------' AS nvarchar(20)) AS separator_shaped_data;
+          SELECT CAST(REPLICATE(N'W', 96) AS nvarchar(96)) AS wide_96, CAST(N'tail' AS nvarchar(8)) AS tail;
+          SELECT CAST(N'café 漢字 😀' AS nvarchar(40)) AS unicode_text;
+          SET NOCOUNT ON;
+          SELECT CAST(N'nocount-on' AS nvarchar(16)) AS no_footer_result;
+          SET NOCOUNT OFF;
+          PRINT N'fixture-message-after';
+          GO
+          '@
+          $routeSql = @'
+          SET NOCOUNT OFF;
+          PRINT N'fixture-r1-message';
+          SELECT CAST(N'route-ok' AS nvarchar(16)) AS route_value;
+          GO
+          '@
+          $errorSql = @'
+          RAISERROR(N'fixture-error-severity-16', 16, 1);
+          GO
+          '@
+          [System.IO.File]::WriteAllText($successScript, $successSql, $utf8Bom)
+          [System.IO.File]::WriteAllText($routeScript, $routeSql, $utf8Bom)
+          [System.IO.File]::WriteAllText($errorScript, $errorSql, $utf8Bom)
+          $querySql = "SET NOCOUNT OFF; PRINT N'fixture-q-message'; SELECT CAST(N'q-mode' AS nvarchar(16)) AS query_mode;"
+          $stdinSql = "SET NOCOUNT OFF; PRINT N'fixture-stdin-message'; SELECT CAST(N'stdin-mode' AS nvarchar(16)) AS stdin_mode;`r`nGO`r`n"
+
+          $captures = [System.Collections.Generic.List[object]]::new()
+          $odbcVersion = Invoke-ByteCapture 'odbc-help' $odbcSqlcmd @('-?')
+          $goVersion = Invoke-ByteCapture 'go-version' $goSqlcmd @('--version')
+          $goQueryHelp = Invoke-ByteCapture 'go-query-help' $goSqlcmd @('query', '--help')
+          if ($odbcVersion.ExitCode -ne 0 -or $goVersion.ExitCode -ne 0 -or $goQueryHelp.ExitCode -ne 0) {
+            throw 'A SQLCMD version probe failed'
+          }
+          if ((Get-CaptureText $odbcVersion 'stdout') -notmatch '17\.0\.4055\.5') {
+            throw 'ODBC sqlcmd help did not report 17.0.4055.5'
+          }
+          if ((Get-CaptureText $goVersion 'stdout') -notmatch '1\.10\.0') {
+            throw 'Go sqlcmd did not report v1.10.0'
+          }
+          if ((Get-CaptureText $goQueryHelp 'stdout') -notmatch 'sqlcmd query') {
+            throw 'Go sqlcmd did not expose the modern query command'
+          }
+          [void]$captures.Add($odbcVersion)
+          [void]$captures.Add($goVersion)
+          [void]$captures.Add($goQueryHelp)
+
+          $connection = @('-S', 'lpc:.\RTKFIXTURE1832', '-E', '-C', '-l', '5')
+          $odbcConnection = $connection + @('-f', '65001')
+          $goConnection = $connection
+          $transportQuery = "SET NOCOUNT ON; SELECT CONCAT(net_transport, N'|', auth_scheme, N'|', CONVERT(int, SERVERPROPERTY('IsIntegratedSecurityOnly')), N'|', CONVERT(nvarchar(32), SERVERPROPERTY('ProductVersion')), N'|', CONVERT(int, SERVERPROPERTY('EngineEdition'))) FROM sys.dm_exec_connections WHERE session_id = @@SPID;"
+          $odbcTransportArguments = $odbcConnection + @('-b', '-h', '-1', '-W', '-Q', $transportQuery)
+          $goTransportArguments = $goConnection + @('-b', '-h', '-1', '-W', '-Q', $transportQuery)
+          $odbcTransport = $null
+          for ($attempt = 1; $attempt -le 12; $attempt++) {
+            $candidate = Invoke-ByteCapture 'odbc-transport' $odbcSqlcmd $odbcTransportArguments
+            if ($candidate.ExitCode -eq 0 -and (Get-CaptureText $candidate 'stdout') -match 'Shared memory\|(NTLM|KERBEROS)\|1\|17\.0\.1000\.7\|4') {
+              $odbcTransport = $candidate
+              break
+            }
+            if ($attempt -lt 12) {
+              Start-Sleep -Seconds 5
+            }
+          }
+          if ($null -eq $odbcTransport) {
+            throw 'ODBC sqlcmd was not ready over authenticated Shared Memory within two minutes'
+          }
+          $goTransport = Invoke-ByteCapture 'go-transport' $goSqlcmd $goTransportArguments
+          foreach ($transport in @($odbcTransport, $goTransport)) {
+            if ($transport.ExitCode -ne 0 -or (Get-CaptureText $transport 'stdout') -notmatch 'Shared memory\|(NTLM|KERBEROS)\|1\|17\.0\.1000\.7\|4') {
+              throw "$($transport.Name) did not connect over Shared Memory"
+            }
+            [void]$captures.Add($transport)
+          }
+
+          foreach ($client in @(
+            [pscustomobject]@{ Name = 'odbc'; Path = $odbcSqlcmd; Connection = $odbcConnection },
+            [pscustomobject]@{ Name = 'go'; Path = $goSqlcmd; Connection = $goConnection }
+          )) {
+            $success = Invoke-ByteCapture "$($client.Name)-success-default" $client.Path ($client.Connection + @('-i', $successScript))
+            $query = Invoke-ByteCapture "$($client.Name)-query-default" $client.Path ($client.Connection + @('-Q', $querySql))
+            $stdin = Invoke-ByteCapture -Name "$($client.Name)-stdin-default" -FilePath $client.Path -ArgumentList $client.Connection -StandardInputText $stdinSql
+            $route = Invoke-ByteCapture "$($client.Name)-route-r1" $client.Path ($client.Connection + @('-r1', '-i', $routeScript))
+            $failure = Invoke-ByteCapture "$($client.Name)-error-b-r1" $client.Path ($client.Connection + @('-b', '-r1', '-i', $errorScript))
+            if ($success.ExitCode -ne 0 -or $query.ExitCode -ne 0 -or $stdin.ExitCode -ne 0 -or
+                $route.ExitCode -ne 0 -or $failure.ExitCode -eq 0) {
+              throw "$($client.Name) returned an unexpected fixture exit code"
+            }
+            $successStdout = Get-CaptureText $success 'stdout'
+            $successStderr = Get-CaptureText $success 'stderr'
+            $queryStdout = Get-CaptureText $query 'stdout'
+            $queryStderr = Get-CaptureText $query 'stderr'
+            $stdinStdout = Get-CaptureText $stdin 'stdout'
+            $stdinStderr = Get-CaptureText $stdin 'stderr'
+            $routeStdout = Get-CaptureText $route 'stdout'
+            $routeStderr = Get-CaptureText $route 'stderr'
+            $failureStdout = Get-CaptureText $failure 'stdout'
+            $failureStderr = Get-CaptureText $failure 'stderr'
+            foreach ($marker in @(
+              'fixture-message-before', '  alpha  ', 'utf16_units', 'a  b   c',
+              'first', 'second', 'third', 'zero_rows', '(3 rows affected)',
+              '--------------------', 'tail', 'café', '漢字', 'nocount-on',
+              '😀', 'empty_text', 'null_text', 'NULL', '(0 rows affected)',
+              'fixture-message-after'
+            )) {
+              if (-not $successStdout.Contains($marker)) {
+                throw "$($client.Name) default fixture is missing marker: $marker"
+              }
+            }
+            if ($successStderr.Length -ne 0 -or ([regex]::Matches($successStdout, 'W')).Count -ne 96 -or
+                ([regex]::Matches($successStdout, [regex]::Escape('(3 rows affected)'))).Count -lt 2 -or
+                $successStdout -notmatch 'alpha\s+9' -or
+                -not $queryStdout.Contains('fixture-q-message') -or -not $queryStdout.Contains('q-mode') -or
+                $queryStderr.Length -ne 0 -or -not $stdinStdout.Contains('fixture-stdin-message') -or
+                -not $stdinStdout.Contains('stdin-mode') -or $stdinStderr.Length -ne 0 -or
+                -not $routeStderr.Contains('fixture-r1-message') -or $routeStdout.Contains('fixture-r1-message') -or
+                -not $routeStdout.Contains('route-ok') -or -not $failureStderr.Contains('fixture-error-severity-16') -or
+                $failureStdout.Contains('fixture-error-severity-16')) {
+              throw "$($client.Name) did not route expected fixture markers"
+            }
+            [void]$captures.Add($success)
+            [void]$captures.Add($query)
+            [void]$captures.Add($stdin)
+            [void]$captures.Add($route)
+            [void]$captures.Add($failure)
+          }
+
+          Write-Host 'FIXTURE_EXPECTATION significant_edges_utf16_units=9 wide_value_characters=96 modern_query_live_capture=false'
+          foreach ($capture in $captures) {
+            Write-CaptureRecord -Capture $capture
+          }
+          Write-Host "CAPTURE_COMPLETE count=$($captures.Count) synthetic_only=true artifacts_uploaded=false"
+
+      - name: Stop ephemeral SQL services
+        if: always()
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Stop-Service -Name 'SQLBrowser' -Force -ErrorAction SilentlyContinue
+          Stop-Service -Name 'MSSQL$RTKFIXTURE1832' -Force -ErrorAction SilentlyContinue
+
+          $fixtureRoot = [System.IO.Path]::GetFullPath(
+            (Join-Path $env:RUNNER_TEMP 'sqlcmd-fixtures-1832')
+          ).TrimEnd([System.IO.Path]::DirectorySeparatorChar)
+          $runnerTempPrefix = [System.IO.Path]::GetFullPath($env:RUNNER_TEMP).TrimEnd(
+            [System.IO.Path]::DirectorySeparatorChar
+          ) + [System.IO.Path]::DirectorySeparatorChar
+          if (-not $fixtureRoot.StartsWith($runnerTempPrefix, [System.StringComparison]::OrdinalIgnoreCase) -or
+              [System.IO.Path]::GetFileName($fixtureRoot) -ne 'sqlcmd-fixtures-1832') {
+            throw 'Refusing to clean an unexpected fixture path'
+          }
+          if (Test-Path -LiteralPath $fixtureRoot -PathType Container) {
+            Remove-Item -LiteralPath $fixtureRoot -Recurse -Force
+          }
+          Write-Host 'CLEANUP_COMPLETE services_stopped=true fixture_temp_removed=true'
