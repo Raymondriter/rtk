@@ -238,6 +238,17 @@ rtk bundle install              # Ruby gems (strip Using lines)
 rtk prisma generate             # Schema generation (no ASCII art)
 ```
 
+### Runtimes
+```bash
+rtk bun install                  # Strip progress and version lines
+rtk bun test                     # Failures only (-90%)
+rtk bun build                    # Errors only when writing to disk, else passthrough
+rtk bunx tsc                     # Smart routing to tsc filter
+rtk deno test                    # Failures only (-90%)
+rtk deno lint                    # Strip download lines + tee recovery
+rtk deno check                   # Strip download lines + tee recovery
+```
+
 ### AWS
 ```bash
 rtk aws sts get-caller-identity # One-line identity
@@ -423,7 +434,7 @@ For per-agent setup details, override controls, and graceful degradation, see th
 
 ```toml
 [hooks]
-exclude_commands = ["curl", "playwright"]  # skip rewrite for these
+exclude_commands = ["curl", "playwright"]  # skip rewrite for these (matches `npx playwright` too)
 
 [tee]
 enabled = true          # save raw output on failure (default: true)
