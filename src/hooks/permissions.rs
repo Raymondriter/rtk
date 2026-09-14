@@ -4,7 +4,7 @@ use super::constants::{
 };
 use super::init::resolve_claude_dir;
 use crate::core::stream::exec_capture;
-use crate::discover::lexer::split_for_permissions;
+use crate::discover::lexer::{is_word_boundary_whitespace, split_for_permissions};
 use serde_json::Value;
 use std::path::PathBuf;
 
@@ -34,6 +34,7 @@ pub fn check_command(cmd: &str) -> PermissionVerdict {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Host {
     Claude,
+    Codex,
     Cursor,
     Gemini,
     Droid,
@@ -57,7 +58,11 @@ pub(crate) fn load_rules_for(host: Host) -> (Vec<String>, Vec<String>, Vec<Strin
         Host::Cursor => load_cursor_rules(),
         Host::Gemini => load_gemini_rules(),
         Host::Droid => load_droid_rules(),
-        Host::Vibe => (Vec::new(), Vec::new(), Vec::new()),
+        // Hosts with no RTK-side rule source. Codex enforces its native
+        // execution rules after updatedInput. Do not interpret either host's
+        // rules as Claude Bash patterns or borrow another host's settings.
+        // No RTK-side match means Default, not an explicit Allow.
+        Host::Codex | Host::Vibe => (Vec::new(), Vec::new(), Vec::new()),
     }
 }
 
@@ -404,8 +409,16 @@ pub(crate) fn extract_bash_pattern(rule: &str) -> &str {
 /// - `* suffix`, `pre * suf` → glob matching where `*` matches any sequence of characters
 /// - `pattern` → exact match or prefix match (cmd must equal pattern or start with `{pattern} `)
 pub(crate) fn command_matches_pattern(cmd: &str, pattern: &str) -> bool {
-    let cmd_norm = cmd.split_whitespace().collect::<Vec<_>>().join(" ");
-    let pattern_norm = pattern.split_whitespace().collect::<Vec<_>>().join(" ");
+    // Shares the lexer's word-boundary definition rather than
+    // str::split_whitespace(), so a bare `\r` in `cmd` never collapses into a space.
+    let normalize = |s: &str| {
+        s.split(is_word_boundary_whitespace)
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    let cmd_norm = normalize(cmd);
+    let pattern_norm = normalize(pattern);
     let cmd = cmd_norm.as_str();
     let pattern = pattern_norm.as_str();
 
@@ -997,6 +1010,32 @@ mod tests {
         assert_eq!(
             check_command_with_rules("git status\nrm -rf ~", &[], &[], &allow),
             PermissionVerdict::Default
+        );
+    }
+
+    #[test]
+    fn test_lone_cr_hidden_command_not_auto_allowed() {
+        let allow = vec!["git status".to_string()];
+        assert_eq!(
+            check_command_with_rules("git status\rrm -rf ~", &[], &[], &allow),
+            PermissionVerdict::Default
+        );
+    }
+
+    #[test]
+    fn test_lone_cr_does_not_collapse_to_space_in_pattern_match() {
+        assert!(!command_matches_pattern(
+            "git status\rrm -rf ~",
+            "git status"
+        ));
+    }
+
+    #[test]
+    fn test_lone_cr_segment_still_denied() {
+        let deny = vec!["rm:*".to_string()];
+        assert_eq!(
+            check_command_with_rules("git status\rrm -rf ~", &deny, &[], &[]),
+            PermissionVerdict::Deny
         );
     }
 

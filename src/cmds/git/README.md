@@ -5,6 +5,7 @@
 ## Specifics
 
 - **git.rs** uses `trailing_var_arg = true` + `allow_hyphen_values = true` so native git flags (`--oneline`, `--cached`, etc.) pass through correctly
+- Flag grammar (which flags take a value, what `-u`/`-p` mean) is per-subcommand, not shared wholesale between `log`/`diff`/`show`/`stash show` — see [`src/core/README.md`](../../core/README.md#argument-tokenizer-arg_tokenizerrs)
 - **svn_cmd.rs** defaults native `svn log` to 10 revisions with a recovery hint unless the caller supplies a limit/revision/change window, then removes only structurally proven separators; `svn status`, `svn diff`, search/detailed log shapes, global-option-first invocations, and unsupported or mutating subcommands remain exact passthrough
 - Filtered SVN logs inherit stdin and relay stderr chunks live for authentication/certificate prompts; password-bearing arguments are redacted from verbose/tracking labels without changing the forwarded argv
 - Captured logs above 10 MiB switch to complete native stdout streaming instead of truncating output

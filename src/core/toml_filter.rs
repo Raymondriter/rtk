@@ -302,6 +302,7 @@ const RUST_HANDLED_COMMANDS: &[&str] = &[
     "pytest",
     "mypy",
     "pip",
+    "sqlfluff",
     "go",
     "golangci-lint",
     "rewrite",
