@@ -927,6 +927,7 @@ mod tests {
             savings_pct: 50.0,
             total_time_ms: 0,
             avg_time_ms: 0,
+            timed_commands: 10,
         }];
 
         let merged = merge_monthly(Some(cc), rtk);
@@ -967,6 +968,7 @@ mod tests {
             savings_pct: 50.0,
             total_time_ms: 0,
             avg_time_ms: 0,
+            timed_commands: 10,
         }];
 
         let merged = merge_monthly(None, rtk);
@@ -987,6 +989,7 @@ mod tests {
                 savings_pct: 40.0,
                 total_time_ms: 0,
                 avg_time_ms: 0,
+                timed_commands: 5,
             },
             MonthStats {
                 month: "2026-01".to_string(),
@@ -997,6 +1000,7 @@ mod tests {
                 savings_pct: 60.0,
                 total_time_ms: 0,
                 avg_time_ms: 0,
+                timed_commands: 10,
             },
         ];
 
